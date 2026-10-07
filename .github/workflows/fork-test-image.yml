@@ -1,0 +1,88 @@
+name: Test Image (build & push to this repo's GHCR)
+
+# Builds the main Dokploy image and pushes it to the GHCR registry of
+# *whichever repository this runs in* (`ghcr.io/<owner>/<repo>`), so a fork
+# gets its own test image without needing the `GHCR_TOKEN` secret the
+# production workflow (dokploy.yml) uses. Auth is the built-in GITHUB_TOKEN.
+#
+# Triggers:
+#   - push to canary or any fix/** branch: a fresh test image for the branch
+#     tip (docs-only pushes are ignored, same as dokploy.yml). GitHub only
+#     runs push triggers for workflows present ON the pushed branch, so this
+#     file must exist on the branch you want built.
+#   - pull_request against canary: builds the PR's merge commit using THIS
+#     file from the base branch, so PR branches don't need to carry it.
+#     NOTE: GitHub downgrades the token for PRs from forks, so those runs
+#     can build but fail at the push step — same-repo PRs push fine.
+#   - workflow_dispatch: manual rebuild of the selected branch.
+#
+# Tags: `test-<branch>` (moving) plus `test-<branch>-<sha7>` / `pr-<n>-<sha7>`
+# (immutable), so a running test can always be pinned back to a digest.
+
+on:
+  push:
+    branches: [canary, "fix/**"]
+    paths-ignore:
+      - "docs/**"
+  pull_request:
+    branches: [canary]
+    paths-ignore:
+      - "docs/**"
+  workflow_dispatch:
+
+concurrency:
+  group: test-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set image name and tags
+        id: meta
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          # GHCR requires a lowercase image name; github.repository preserves
+          # the owner's original casing.
+          IMAGE="ghcr.io/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            TAG="pr-${PR_NUMBER}"
+          else
+            TAG="test-$(echo "${GITHUB_REF_NAME}" | tr '/:' '--')"
+          fi
+          echo "tags=${IMAGE}:${TAG},${IMAGE}:${TAG}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "Image: ${IMAGE}:${TAG}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Prepare env file
+        run: |
+          cp apps/dokploy/.env.production.example .env.production
+          cp apps/dokploy/.env.production.example apps/dokploy/.env.production
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
