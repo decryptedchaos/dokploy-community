@@ -84,6 +84,7 @@ resolve them by hand — annoying but not dangerous).
 | `CNAME` | Fork | ours (`merge=ours`) |
 | `install.sh` | Fork | ours (`merge=ours`) |
 | `.github/workflows/dokploy.yml` | Fork | ours (`merge=ours`) — GHCR publish; ignore upstream release automation |
+| `.github/workflows/fork-test-image.yml` | Fork | ours (`merge=ours`) — builds a test image into *this* repo's own GHCR (`GITHUB_TOKEN`, no secrets); fork-only tooling, never upstream it and never include it in a PR to upstream. Lives on `canary` so every feature branch cut from it carries the push trigger. |
 | `apps/dokploy/package.json` (`version`) | Fork | `vX.Y.Z-community.N` |
 | `packages/server/src/services/settings.ts` | Shared | keep fork image/update sources (DevinoSolutions repo, `ghcr.io/devinosolutions`); adopt unrelated upstream logic around them |
 | Network management feature (below) | Fork | keep; re-integrate onto upstream |

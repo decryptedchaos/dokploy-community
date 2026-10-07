@@ -6,10 +6,15 @@ name: Test Image (build & push to this repo's GHCR)
 # production workflow (dokploy.yml) uses. Auth is the built-in GITHUB_TOKEN.
 #
 # Triggers:
-#   - push to canary or any fix/** branch: a fresh test image for the branch
-#     tip (docs-only pushes are ignored, same as dokploy.yml). GitHub only
-#     runs push triggers for workflows present ON the pushed branch, so this
-#     file must exist on the branch you want built.
+#   - push to any branch except main: a fresh test image for the branch tip
+#     (docs-only pushes are ignored, same as dokploy.yml). Every future
+#     branch cut from canary carries this file, so no per-branch trigger
+#     edits are ever needed. GitHub only runs push triggers for workflows
+#     present ON the pushed branch — that is why this file lives on canary.
+#
+# FORK-OWNED: this workflow targets this repository's own GHCR and is not
+# meant to be upstreamed. See docs/UPSTREAM_SYNC.md (file ownership) and the
+# merge=ours entry in .gitattributes; never include it in a PR to upstream.
 #   - pull_request against canary: builds the PR's merge commit using THIS
 #     file from the base branch, so PR branches don't need to carry it.
 #     NOTE: GitHub downgrades the token for PRs from forks, so those runs
@@ -21,7 +26,10 @@ name: Test Image (build & push to this repo's GHCR)
 
 on:
   push:
-    branches: [canary, "fix/**"]
+    # Every future branch name (fix/*, feat/*, chore/*, ...) builds without
+    # needing a new glob here. Only main is excluded — it is the stable
+    # release pointer, never a test target.
+    branches-ignore: [main]
     paths-ignore:
       - "docs/**"
   pull_request:

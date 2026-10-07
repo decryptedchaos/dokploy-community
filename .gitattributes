@@ -13,4 +13,7 @@ README.md merge=ours
 CNAME merge=ours
 install.sh merge=ours
 .github/workflows/dokploy.yml merge=ours
+# Fork-only test-image workflow (pushes to this repo's own GHCR); never
+# upstream it. See docs/UPSTREAM_SYNC.md file-ownership table.
+.github/workflows/fork-test-image.yml merge=ours
 patches/*.patch text eol=lf
