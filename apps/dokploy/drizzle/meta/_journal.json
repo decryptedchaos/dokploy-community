@@ -1450,6 +1450,97 @@
       "when": 1790132164605,
       "tag": "0206_blushing_miss_america",
       "breakpoints": true
+    },
+    {
+      "idx": 207,
+      "version": "7",
+      "when": 1791370398351,
+      "tag": "0207_deployment_queue_journal",
+      "breakpoints": true
+    },
+    {
+      "idx": 208,
+      "version": "7",
+      "when": 1791412265920,
+      "tag": "0208_compose_build_server",
+      "breakpoints": true
+    },
+    {
+      "idx": 209,
+      "version": "7",
+      "when": 1791522896676,
+      "tag": "0209_preview_docker_image",
+      "breakpoints": true
+    },
+    {
+      "idx": 210,
+      "version": "7",
+      "when": 1791533105237,
+      "tag": "0210_better_auth_1_7_tables",
+      "breakpoints": true
+    },
+    {
+      "idx": 211,
+      "version": "7",
+      "when": 1791533152655,
+      "tag": "0211_better_auth_1_7_grants",
+      "breakpoints": true
+    },
+    {
+      "idx": 212,
+      "version": "7",
+      "when": 1791654800727,
+      "tag": "0212_uptimely_heartbeat_channel",
+      "breakpoints": true
+    },
+    {
+      "idx": 213,
+      "version": "7",
+      "when": 1791660075039,
+      "tag": "0213_snapvisor_compose_project",
+      "breakpoints": true
+    },
+    {
+      "idx": 214,
+      "version": "7",
+      "when": 1791744752359,
+      "tag": "0214_dodomain_session_token",
+      "breakpoints": true
+    },
+    {
+      "idx": 215,
+      "version": "7",
+      "when": 1791746463215,
+      "tag": "0215_snapvisor_build_checks",
+      "breakpoints": true
+    },
+    {
+      "idx": 216,
+      "version": "7",
+      "when": 1791965442421,
+      "tag": "0216_compose_deploy_guardrails",
+      "breakpoints": true
+    },
+    {
+      "idx": 217,
+      "version": "7",
+      "when": 1792107704233,
+      "tag": "0217_compose_rolling_replace",
+      "breakpoints": true
+    },
+    {
+      "idx": 218,
+      "version": "7",
+      "when": 1792301533362,
+      "tag": "0218_deployment_cancel_audit",
+      "breakpoints": true
+    },
+    {
+      "idx": 219,
+      "version": "7",
+      "when": 1792378342003,
+      "tag": "0219_deployment_cancel_audit_oauth_client",
+      "breakpoints": true
     }
   ]
 }

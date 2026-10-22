@@ -17,3 +17,6 @@ install.sh merge=ours
 # upstream it. See docs/UPSTREAM_SYNC.md file-ownership table.
 .github/workflows/fork-test-image.yml merge=ours
 patches/*.patch text eol=lf
+
+# Shell scripts must stay LF so they run on Linux/macOS from Windows checkouts.
+*.sh text eol=lf

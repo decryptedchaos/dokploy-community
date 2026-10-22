@@ -1,3 +1,4 @@
+import { trimTrailingSlashes } from "@dokploy/server/utils/integrations/base-url";
 import { relations } from "drizzle-orm";
 import {
 	pgEnum,
@@ -27,6 +28,7 @@ export const UPTIMELY_MONITOR_KINDS = [
 	"port",
 	"ssl",
 	"domain",
+	"heartbeat",
 ] as const;
 
 export const uptimelyServiceType = pgEnum(
@@ -89,6 +91,10 @@ export const uptimelyMonitorLink = pgTable(
 		monitorId: text("monitorId").notNull(),
 		kind: uptimelyMonitorKind("kind").notNull(),
 		target: text("target").notNull(),
+		// Only set on `heartbeat` links: the secret of the Incoming Request
+		// monitor that a successful deploy pings. Plaintext like `apiKey`; it is
+		// write-only from the dashboard's perspective and never logged.
+		heartbeatKey: text("heartbeatKey"),
 		createdAt: timestamp("createdAt").notNull().defaultNow(),
 	},
 	(table) => [
@@ -132,7 +138,7 @@ const uptimelyBaseUrlSchema = z
 	.trim()
 	.url("Enter a valid URL")
 	.refine((value) => /^https?:\/\//i.test(value), "Use an http(s) URL")
-	.transform((value) => value.replace(/\/+$/, ""));
+	.transform((value) => trimTrailingSlashes(value));
 
 // Slugs appear in a URL path; keep them to the shape Uptimely generates.
 const uptimelyStatusPageSlugSchema = z
@@ -202,6 +208,54 @@ export const apiLinkUptimelyService = apiUptimelyService.extend({
 
 export const apiPreflightUptimelyService = apiUptimelyService.extend({
 	checkPath: uptimelyCheckPathSchema.optional(),
+});
+
+// The secret of an Incoming Request monitor (a UUID today) is copied either
+// bare or as the URL the monitor's Settings page shows, so both are accepted.
+// Only the key is kept: the ping URL is always built from the integration's
+// own base URL, never from the host of a pasted URL.
+const HEARTBEAT_KEY_PATTERN = /^[A-Za-z0-9_-]{8,128}$/;
+
+/**
+ * Extracts the heartbeat secret from what a person pasted: the bare key, or a
+ * `/heartbeat/<key>` / `/api/incoming-request/<key>` URL. Returns null when no
+ * UUID key can be read from it.
+ */
+export const parseUptimelyHeartbeatKey = (value: string): string | null => {
+	const trimmed = value.trim();
+	if (HEARTBEAT_KEY_PATTERN.test(trimmed)) return trimmed;
+	try {
+		const segments = new URL(trimmed).pathname.split("/").filter(Boolean);
+		const last = segments.at(-1) ?? "";
+		const parent = segments.at(-2) ?? "";
+		if (
+			(parent === "heartbeat" || parent === "incoming-request") &&
+			HEARTBEAT_KEY_PATTERN.test(last)
+		) {
+			return last;
+		}
+	} catch {
+		// Not a URL.
+	}
+	return null;
+};
+
+export const apiUptimelyHeartbeat = z.object({
+	// A deploy only exists for applications and compose services.
+	serviceType: z.enum(["application", "compose"]),
+	serviceId: z.string().min(1),
+});
+
+export const apiSetUptimelyHeartbeatKey = apiUptimelyHeartbeat.extend({
+	// The bare secret, or the heartbeat URL copied from Uptimely.
+	key: z
+		.string()
+		.trim()
+		.min(1)
+		.refine(
+			(value) => parseUptimelyHeartbeatKey(value) !== null,
+			"Paste the heartbeat URL or secret key from the monitor's Settings page in Uptimely",
+		),
 });
 
 export const apiRunUptimelyProbe = apiUptimelyService.extend({

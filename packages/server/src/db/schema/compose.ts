@@ -1,4 +1,13 @@
 import {
+	type DeployGuardrails,
+	deployGuardrailsSchema,
+} from "@dokploy/server/db/validations/compose-guardrails";
+import {
+	type ComposeRollingReplace,
+	composeRollingReplaceSchema,
+} from "@dokploy/server/db/validations/compose-rolling";
+import { deployPriorityInput } from "@dokploy/server/db/validations/deploy-priority";
+import {
 	isValidPreviewWildcard,
 	PREVIEW_WILDCARD_GUIDANCE,
 } from "@dokploy/server/utils/preview-wildcard";
@@ -25,6 +34,7 @@ import { gitlab } from "./gitlab";
 import { mounts } from "./mount";
 import { patch } from "./patch";
 import { previewDeployments } from "./preview-deployments";
+import { registry } from "./registry";
 import { schedules } from "./schedule";
 import { server } from "./server";
 import { applicationStatus, certificateType, triggerType } from "./shared";
@@ -126,6 +136,12 @@ export const compose = pgTable("compose", {
 	)
 		.notNull()
 		.default(true),
+	/**
+	 * Fork column (Snapvisor integration). Name of the Snapvisor project that
+	 * receives this compose service's preview-deployment builds; `null` means
+	 * visual testing is off. See services/snapvisor.ts.
+	 */
+	snapvisorProjectName: text("snapvisorProjectName"),
 	triggerType: triggerType("triggerType").default("push"),
 	composeStatus: applicationStatus("composeStatus").notNull().default("idle"),
 	icon: text("icon"),
@@ -157,6 +173,21 @@ export const compose = pgTable("compose", {
 	serverId: text("serverId").references(() => server.serverId, {
 		onDelete: "cascade",
 	}),
+	/**
+	 * Fork columns (compose build server). When both are set, `docker compose
+	 * build` runs on `buildServerId`, the built images are pushed to
+	 * `buildRegistryId`, and the serving host only pulls and runs them. Always
+	 * set together (enforced by `assertComposeBuildSettings`).
+	 */
+	buildServerId: text("buildServerId").references(() => server.serverId, {
+		onDelete: "set null",
+	}),
+	buildRegistryId: text("buildRegistryId").references(
+		() => registry.registryId,
+		{
+			onDelete: "set null",
+		},
+	),
 	serviceNetworks: jsonb("serviceNetworks")
 		.$type<
 			Array<{
@@ -166,6 +197,19 @@ export const compose = pgTable("compose", {
 			}>
 		>()
 		.default([]),
+	/**
+	 * Fork column: opt-in deploy guardrails (phase timestamps, docker events
+	 * capture, pre-done health check). `null` = everything off, which is every
+	 * existing row. See utils/builders/compose-guardrails.ts.
+	 */
+	deployGuardrails: jsonb("deployGuardrails").$type<DeployGuardrails>(),
+	/**
+	 * Fork column: opt-in rolling replace of selected services (scale up, wait
+	 * healthy, remove the old container). `null` = off, which is every existing
+	 * row. Separate from `deployGuardrails` on purpose: this one acts on the
+	 * deploy, the guardrails only observe. See utils/builders/compose-rolling.ts.
+	 */
+	rollingReplace: jsonb("rollingReplace").$type<ComposeRollingReplace>(),
 });
 
 export const composeRelations = relations(compose, ({ one, many }) => ({
@@ -199,6 +243,17 @@ export const composeRelations = relations(compose, ({ one, many }) => ({
 	server: one(server, {
 		fields: [compose.serverId],
 		references: [server.serverId],
+		relationName: "composeServer",
+	}),
+	buildServer: one(server, {
+		fields: [compose.buildServerId],
+		references: [server.serverId],
+		relationName: "composeBuildServer",
+	}),
+	buildRegistry: one(registry, {
+		fields: [compose.buildRegistryId],
+		references: [registry.registryId],
+		relationName: "composeBuildRegistry",
 	}),
 	backups: many(backups),
 	schedules: many(schedules),
@@ -219,6 +274,8 @@ const createSchema = createInsertSchema(compose, {
 	composeFile: z.string().optional(),
 	environmentId: z.string(),
 	customGitSSHKeyId: z.string().optional(),
+	buildServerId: z.string().nullable().optional(),
+	buildRegistryId: z.string().nullable().optional(),
 	command: z.string().optional(),
 	createEnvFile: z.boolean().optional(),
 	composePath: z.string().min(1),
@@ -253,6 +310,8 @@ const createSchema = createInsertSchema(compose, {
 			}),
 		)
 		.optional(),
+	deployGuardrails: deployGuardrailsSchema.nullable().optional(),
+	rollingReplace: composeRollingReplaceSchema.nullable().optional(),
 });
 
 export const apiCreateCompose = createSchema.pick({
@@ -284,6 +343,7 @@ export const apiDeployCompose = z.object({
 	title: z.string().optional(),
 	description: z.string().optional(),
 	freshVolumes: z.boolean().optional(),
+	priority: deployPriorityInput,
 });
 
 export const apiRedeployCompose = z.object({
@@ -291,6 +351,7 @@ export const apiRedeployCompose = z.object({
 	title: z.string().optional(),
 	description: z.string().optional(),
 	freshVolumes: z.boolean().optional(),
+	priority: deployPriorityInput,
 });
 
 export const apiDeleteCompose = z.object({
@@ -310,7 +371,9 @@ export const apiUpdateCompose = createSchema
 		composeFile: z.string().optional(),
 		command: z.string().optional(),
 	})
-	.omit({ serverId: true });
+	// `snapvisorProjectName` only goes through `snapvisor.setComposeProject`,
+	// which validates the slug and checks the organization.
+	.omit({ serverId: true, snapvisorProjectName: true });
 
 export const apiSaveEnvironmentVariablesCompose = createSchema
 	.pick({

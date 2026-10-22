@@ -136,6 +136,33 @@ describe("handleGiteaApplicationPullRequestEvent", () => {
 		);
 	});
 
+	it("queues the preview on the server of the application", async () => {
+		await handleGiteaApplicationPullRequestEvent({
+			application: createApplication({ serverId: "server-1" }) as any,
+			body: createBody(),
+		});
+
+		expect(mocks.queueAdd).toHaveBeenCalledWith(
+			"deployments",
+			expect.objectContaining({
+				applicationId: "app-1",
+				applicationType: "application-preview",
+				serverId: "server-1",
+			}),
+			expect.anything(),
+		);
+	});
+
+	it("leaves serverId off the preview job of a local application", async () => {
+		await handleGiteaApplicationPullRequestEvent({
+			application: createApplication() as any,
+			body: createBody(),
+		});
+
+		const job = mocks.queueAdd.mock.calls[0]?.[1];
+		expect(job.serverId).toBeUndefined();
+	});
+
 	it("redeploys the existing preview on 'synchronized' without creating a second one", async () => {
 		mocks.findPreviewDeploymentByApplicationId.mockResolvedValue({
 			previewDeploymentId: "preview-existing",
@@ -196,7 +223,7 @@ describe("handleGiteaApplicationPullRequestEvent", () => {
 		expect(mocks.queueAdd).not.toHaveBeenCalled();
 	});
 
-	it("skips pull requests opened from a fork", async () => {
+	it("creates a preview for a pull request opened from a fork", async () => {
 		const result = await handleGiteaApplicationPullRequestEvent({
 			application: createApplication() as any,
 			body: createBody({
@@ -204,14 +231,33 @@ describe("handleGiteaApplicationPullRequestEvent", () => {
 					head: {
 						ref: "feature/thing",
 						sha: "deadbeef",
-						repo: { name: "web", owner: { login: "someone-else" } },
+						repo: { name: "fork-web", owner: { login: "someone-else" } },
 					},
 				},
 			}),
 		});
 
 		expect(result.status).toBe(200);
-		expect(mocks.queueAdd).not.toHaveBeenCalled();
+		// The head branch only exists in the fork, but the preview row still
+		// records it — the deploy checks out `refs/pull/7/head` on the configured
+		// repository instead of cloning the branch (head-ref.ts).
+		expect(mocks.createPreviewDeployment).toHaveBeenCalledWith({
+			applicationId: "app-1",
+			branch: "feature/thing",
+			pullRequestId: "42",
+			pullRequestNumber: "7",
+			pullRequestTitle: "Add a thing",
+			pullRequestURL: "https://gitea.example.com/acme/web/pulls/7",
+		});
+		expect(mocks.queueAdd).toHaveBeenCalledWith(
+			"deployments",
+			expect.objectContaining({
+				applicationType: "application-preview",
+				previewDeploymentId: "preview-1",
+				descriptionLog: "Hash: deadbeef",
+			}),
+			expect.anything(),
+		);
 	});
 
 	it("blocks an author without write access and reports it on the pull request", async () => {
@@ -477,6 +523,23 @@ describe("handleGiteaComposePullRequestEvent", () => {
 				composeId: "compose-1",
 				applicationType: "compose-preview",
 				previewDeploymentId: "compose-preview-1",
+			}),
+			expect.anything(),
+		);
+	});
+
+	it("queues the compose preview on the server of the compose", async () => {
+		await handleGiteaComposePullRequestEvent({
+			compose: createCompose({ serverId: "server-1" }) as any,
+			body: createBody(),
+		});
+
+		expect(mocks.queueAdd).toHaveBeenCalledWith(
+			"deployments",
+			expect.objectContaining({
+				composeId: "compose-1",
+				applicationType: "compose-preview",
+				serverId: "server-1",
 			}),
 			expect.anything(),
 		);

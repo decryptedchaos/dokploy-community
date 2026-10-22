@@ -1,3 +1,4 @@
+import { trimTrailingSlashes } from "@dokploy/server/utils/integrations/base-url";
 import { relations } from "drizzle-orm";
 import {
 	boolean,
@@ -6,6 +7,8 @@ import {
 	pgEnum,
 	pgTable,
 	text,
+	timestamp,
+	uniqueIndex,
 } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { nanoid } from "nanoid";
@@ -27,6 +30,7 @@ export const notificationType = pgEnum("notificationType", [
 	"teams",
 	"sendly",
 	"notifly",
+	"uptimely",
 ]);
 
 export const notifications = pgTable("notification", {
@@ -44,6 +48,7 @@ export const notifications = pgTable("notification", {
 	dockerCleanup: boolean("dockerCleanup").notNull().default(false),
 	serverThreshold: boolean("serverThreshold").notNull().default(false),
 	scheduleFailure: boolean("scheduleFailure").notNull().default(false),
+	snapvisorChanges: boolean("snapvisorChanges").notNull().default(false),
 	notificationType: notificationType("notificationType").notNull(),
 	createdAt: text("createdAt")
 		.notNull()
@@ -90,6 +95,10 @@ export const notifications = pgTable("notification", {
 	notiflyId: text("notiflyId").references(() => notifly.notiflyId, {
 		onDelete: "cascade",
 	}),
+	uptimelyChannelId: text("uptimelyChannelId").references(
+		() => uptimelyChannel.uptimelyChannelId,
+		{ onDelete: "cascade" },
+	),
 	organizationId: text("organizationId")
 		.notNull()
 		.references(() => organization.id, { onDelete: "cascade" }),
@@ -237,6 +246,58 @@ export const notifly = pgTable("notifly", {
 	baseUrl: text("baseUrl").notNull().default("https://api.notifly.io"),
 });
 
+/**
+ * Uptimely as a notification channel: a deploy failure declares an incident in
+ * the Uptimely project and the next success of the same service resolves it.
+ * Credentials live here (not on `uptimely_integration`) so a channel can target
+ * a different project than the organization's monitoring integration.
+ */
+export const uptimelyChannel = pgTable("uptimely_channel", {
+	uptimelyChannelId: text("uptimelyChannelId")
+		.notNull()
+		.primaryKey()
+		.$defaultFn(() => nanoid()),
+	apiKey: text("apiKey").notNull(),
+	projectId: text("projectId").notNull(),
+	baseUrl: text("baseUrl").notNull().default("https://app.getuptimely.com"),
+	// No Uptimely tool lists incident states, so the Resolved state id is
+	// learned from the project's existing incidents; this overrides that.
+	resolvedStateId: text("resolvedStateId"),
+});
+
+/**
+ * The incident a channel declared for a service whose last deploy failed. The
+ * row is deleted when the incident is resolved. A row with no `incidentId` is a
+ * claim taken by the failure that is declaring it, so concurrent failures of
+ * one service open a single incident. `serviceKey` is
+ * `<application|compose>:<serviceId>`.
+ */
+export const uptimelyChannelIncident = pgTable(
+	"uptimely_channel_incident",
+	{
+		channelIncidentId: text("channelIncidentId")
+			.notNull()
+			.primaryKey()
+			.$defaultFn(() => nanoid()),
+		uptimelyChannelId: text("uptimelyChannelId")
+			.notNull()
+			.references(() => uptimelyChannel.uptimelyChannelId, {
+				onDelete: "cascade",
+			}),
+		serviceKey: text("serviceKey").notNull(),
+		// Null while the row is a claim: the failure that inserted it is still
+		// declaring the incident.
+		incidentId: text("incidentId"),
+		createdAt: timestamp("createdAt").notNull().defaultNow(),
+	},
+	(table) => [
+		uniqueIndex("uptimely_channel_incident_service_unique").on(
+			table.uptimelyChannelId,
+			table.serviceKey,
+		),
+	],
+);
+
 export const notificationsRelations = relations(notifications, ({ one }) => ({
 	slack: one(slack, {
 		fields: [notifications.slackId],
@@ -294,6 +355,10 @@ export const notificationsRelations = relations(notifications, ({ one }) => ({
 		fields: [notifications.notiflyId],
 		references: [notifly.notiflyId],
 	}),
+	uptimelyChannel: one(uptimelyChannel, {
+		fields: [notifications.uptimelyChannelId],
+		references: [uptimelyChannel.uptimelyChannelId],
+	}),
 	organization: one(organization, {
 		fields: [notifications.organizationId],
 		references: [organization.id],
@@ -301,6 +366,35 @@ export const notificationsRelations = relations(notifications, ({ one }) => ({
 }));
 
 export const notificationsSchema = createInsertSchema(notifications);
+
+// Write-only secrets (webhook URLs, tokens, keys, passwords): on update a blank
+// or omitted value keeps the stored one, and on the "Test" button of the edit
+// form it selects the stored value of `notificationId` (org-checked
+// server-side). A typed value always replaces / is used as is.
+const writeOnlySecret = z.string().trim().optional();
+// Defense in depth for the URLs that are redacted on read and compared on
+// update: nothing legitimate is longer.
+const MAX_URL_LENGTH = 2048;
+const urlTooLong = { message: "The URL is too long" };
+const testNotificationId = z.string().optional();
+/**
+ * The Snapvisor event flag is optional on create (absent = off) so API and MCP
+ * clients written before it existed keep working; the create schemas are
+ * otherwise `.required()`, which would make it mandatory.
+ */
+const snapvisorChangesField = { snapvisorChanges: z.boolean().optional() };
+
+// Same, for a webhook that has to be a URL once one is typed.
+const optionalWebhookUrl = z
+	.string()
+	.trim()
+	.refine(
+		(value) => value === "" || z.string().url().safeParse(value).success,
+		{
+			message: "Invalid url",
+		},
+	)
+	.optional();
 
 export const apiCreateSlack = notificationsSchema
 	.pick({
@@ -319,18 +413,25 @@ export const apiCreateSlack = notificationsSchema
 		webhookUrl: z.string().min(1),
 		channel: z.string(),
 	})
-	.required();
+	.required()
+	.extend(snapvisorChangesField);
 
 export const apiUpdateSlack = apiCreateSlack.partial().extend({
 	notificationId: z.string().min(1),
-	slackId: z.string(),
+	// Ignored: the provider row is derived from the notification row.
+	slackId: z.string().optional(),
+	webhookUrl: writeOnlySecret,
 	organizationId: z.string().optional(),
 });
 
-export const apiTestSlackConnection = apiCreateSlack.pick({
-	webhookUrl: true,
-	channel: true,
-});
+export const apiTestSlackConnection = apiCreateSlack
+	.pick({
+		channel: true,
+	})
+	.extend({
+		webhookUrl: writeOnlySecret,
+		notificationId: testNotificationId,
+	});
 
 export const apiCreateTelegram = notificationsSchema
 	.pick({
@@ -350,19 +451,26 @@ export const apiCreateTelegram = notificationsSchema
 		chatId: z.string().min(1),
 		messageThreadId: z.string(),
 	})
-	.required();
+	.required()
+	.extend(snapvisorChangesField);
 
 export const apiUpdateTelegram = apiCreateTelegram.partial().extend({
 	notificationId: z.string().min(1),
-	telegramId: z.string().min(1),
+	// Ignored: the provider row is derived from the notification row.
+	telegramId: z.string().optional(),
+	botToken: writeOnlySecret,
 	organizationId: z.string().optional(),
 });
 
-export const apiTestTelegramConnection = apiCreateTelegram.pick({
-	botToken: true,
-	chatId: true,
-	messageThreadId: true,
-});
+export const apiTestTelegramConnection = apiCreateTelegram
+	.pick({
+		chatId: true,
+		messageThreadId: true,
+	})
+	.extend({
+		botToken: writeOnlySecret,
+		notificationId: testNotificationId,
+	});
 
 export const apiCreateDiscord = notificationsSchema
 	.pick({
@@ -381,21 +489,22 @@ export const apiCreateDiscord = notificationsSchema
 		webhookUrl: z.string().min(1),
 		decoration: z.boolean(),
 	})
-	.required();
+	.required()
+	.extend(snapvisorChangesField);
 
 export const apiUpdateDiscord = apiCreateDiscord.partial().extend({
 	notificationId: z.string().min(1),
-	discordId: z.string().min(1),
+	// Ignored: the provider row is derived from the notification row.
+	discordId: z.string().optional(),
+	webhookUrl: writeOnlySecret,
 	organizationId: z.string().optional(),
 });
 
-export const apiTestDiscordConnection = apiCreateDiscord
-	.pick({
-		webhookUrl: true,
-	})
-	.extend({
-		decoration: z.boolean().optional(),
-	});
+export const apiTestDiscordConnection = z.object({
+	webhookUrl: writeOnlySecret,
+	notificationId: testNotificationId,
+	decoration: z.boolean().optional(),
+});
 
 export const apiCreateEmail = notificationsSchema
 	.pick({
@@ -418,22 +527,31 @@ export const apiCreateEmail = notificationsSchema
 		fromAddress: z.string().min(1),
 		toAddresses: z.array(z.string()).min(1),
 	})
-	.required();
+	.required()
+	.extend(snapvisorChangesField);
 
 export const apiUpdateEmail = apiCreateEmail.partial().extend({
 	notificationId: z.string().min(1),
-	emailId: z.string().min(1),
+	// Ignored: the provider row is derived from the notification row.
+	emailId: z.string().optional(),
+	// Write-only: blank or omitted keeps the stored password (a blank username
+	// removes the authentication, and the password with it). Not trimmed.
+	password: z.string().optional(),
 	organizationId: z.string().optional(),
 });
 
-export const apiTestEmailConnection = apiCreateEmail.pick({
-	smtpServer: true,
-	smtpPort: true,
-	username: true,
-	password: true,
-	toAddresses: true,
-	fromAddress: true,
-});
+export const apiTestEmailConnection = apiCreateEmail
+	.pick({
+		smtpServer: true,
+		smtpPort: true,
+		username: true,
+		toAddresses: true,
+		fromAddress: true,
+	})
+	.extend({
+		password: z.string().optional(),
+		notificationId: testNotificationId,
+	});
 
 export const apiCreateResend = notificationsSchema
 	.pick({
@@ -453,19 +571,26 @@ export const apiCreateResend = notificationsSchema
 		fromAddress: z.string().min(1),
 		toAddresses: z.array(z.string()).min(1),
 	})
-	.required();
+	.required()
+	.extend(snapvisorChangesField);
 
 export const apiUpdateResend = apiCreateResend.partial().extend({
 	notificationId: z.string().min(1),
-	resendId: z.string().min(1),
+	// Ignored: the provider row is derived from the notification row.
+	resendId: z.string().optional(),
+	apiKey: writeOnlySecret,
 	organizationId: z.string().optional(),
 });
 
-export const apiTestResendConnection = apiCreateResend.pick({
-	apiKey: true,
-	fromAddress: true,
-	toAddresses: true,
-});
+export const apiTestResendConnection = apiCreateResend
+	.pick({
+		fromAddress: true,
+		toAddresses: true,
+	})
+	.extend({
+		apiKey: writeOnlySecret,
+		notificationId: testNotificationId,
+	});
 
 export const apiCreateSendly = notificationsSchema
 	.pick({
@@ -484,22 +609,31 @@ export const apiCreateSendly = notificationsSchema
 		apiKey: z.string().min(1),
 		fromAddress: z.string().min(1),
 		toAddresses: z.array(z.string()).min(1),
-		baseUrl: z.string().min(1),
+		baseUrl: z.string().min(1).max(MAX_URL_LENGTH, urlTooLong),
 	})
-	.required();
+	.required()
+	.extend(snapvisorChangesField);
 
 export const apiUpdateSendly = apiCreateSendly.partial().extend({
 	notificationId: z.string().min(1),
-	sendlyId: z.string().min(1),
+	// Ignored: the channel is derived from the notification row.
+	sendlyId: z.string().optional(),
+	// Write-only: blank or omitted keeps the stored key.
+	apiKey: z.string().trim().optional(),
 	organizationId: z.string().optional(),
 });
 
-export const apiTestSendlyConnection = apiCreateSendly.pick({
-	apiKey: true,
-	fromAddress: true,
-	toAddresses: true,
-	baseUrl: true,
-});
+export const apiTestSendlyConnection = apiCreateSendly
+	.pick({
+		fromAddress: true,
+		toAddresses: true,
+		baseUrl: true,
+	})
+	.extend({
+		// Blank on the edit flow: the stored key of `notificationId` is used.
+		apiKey: z.string().trim().optional(),
+		notificationId: z.string().optional(),
+	});
 
 export const apiCreateNotifly = notificationsSchema
 	.pick({
@@ -518,22 +652,104 @@ export const apiCreateNotifly = notificationsSchema
 		apiKey: z.string().min(1),
 		workflowKey: z.string().min(1),
 		subscriberId: z.string().optional(),
-		baseUrl: z.string().min(1),
+		baseUrl: z.string().min(1).max(MAX_URL_LENGTH, urlTooLong),
 	})
-	.required();
+	.required()
+	.extend(snapvisorChangesField);
 
 export const apiUpdateNotifly = apiCreateNotifly.partial().extend({
 	notificationId: z.string().min(1),
-	notiflyId: z.string().min(1),
+	// Ignored: the channel is derived from the notification row.
+	notiflyId: z.string().optional(),
+	// Write-only: blank or omitted keeps the stored key.
+	apiKey: z.string().trim().optional(),
 	organizationId: z.string().optional(),
 });
 
-export const apiTestNotiflyConnection = apiCreateNotifly.pick({
-	apiKey: true,
-	workflowKey: true,
-	subscriberId: true,
-	baseUrl: true,
-});
+export const apiTestNotiflyConnection = apiCreateNotifly
+	.pick({
+		workflowKey: true,
+		subscriberId: true,
+		baseUrl: true,
+	})
+	.extend({
+		// Blank on the edit flow: the stored key of `notificationId` is used.
+		apiKey: z.string().trim().optional(),
+		notificationId: z.string().optional(),
+	});
+
+export const apiCreateUptimelyChannel = notificationsSchema
+	.pick({
+		appBuildError: true,
+		databaseBackup: true,
+		dokployBackup: true,
+		volumeBackup: true,
+		dokployRestart: true,
+		name: true,
+		appDeploy: true,
+		dockerCleanup: true,
+		scheduleFailure: true,
+		snapvisorChanges: true,
+		serverThreshold: true,
+	})
+	.extend({
+		apiKey: z.string().trim().min(1),
+		// Uptimely validates project ids as UUIDs on every tool call.
+		projectId: z.string().trim().uuid("The Uptimely project id is a UUID"),
+		baseUrl: z
+			.string()
+			.trim()
+			.max(MAX_URL_LENGTH, urlTooLong)
+			.url("Enter a valid URL")
+			.refine((value) => /^https?:\/\//i.test(value), "Use an http(s) URL")
+			.transform((value) => trimTrailingSlashes(value)),
+		// Empty clears it; omitted leaves the Resolved state learned from Uptimely.
+		resolvedStateId: z
+			.string()
+			.trim()
+			.uuid("The incident state id is a UUID")
+			.or(z.literal(""))
+			.optional(),
+	})
+	.required({
+		appBuildError: true,
+		databaseBackup: true,
+		dokployBackup: true,
+		volumeBackup: true,
+		dokployRestart: true,
+		name: true,
+		appDeploy: true,
+		dockerCleanup: true,
+		scheduleFailure: true,
+		serverThreshold: true,
+		apiKey: true,
+		projectId: true,
+		baseUrl: true,
+	});
+
+export const apiUpdateUptimelyChannel = apiCreateUptimelyChannel
+	.partial()
+	.extend({
+		notificationId: z.string().min(1),
+		// Ignored: the channel is derived from the notification row.
+		uptimelyChannelId: z.string().optional(),
+		// Write-only: blank or omitted keeps the stored key.
+		apiKey: z.string().trim().optional(),
+		organizationId: z.string().optional(),
+	});
+
+// The test only reads the project (no incident is declared), so it needs the
+// connection fields alone.
+export const apiTestUptimelyChannelConnection = apiCreateUptimelyChannel
+	.pick({
+		projectId: true,
+		baseUrl: true,
+	})
+	.extend({
+		// Blank on the edit flow: the stored key of `notificationId` is used.
+		apiKey: z.string().trim().optional(),
+		notificationId: z.string().optional(),
+	});
 
 export const apiCreateGotify = notificationsSchema
 	.pick({
@@ -549,26 +765,30 @@ export const apiCreateGotify = notificationsSchema
 		serverThreshold: true,
 	})
 	.extend({
-		serverUrl: z.string().min(1),
+		serverUrl: z.string().min(1).max(MAX_URL_LENGTH, urlTooLong),
 		appToken: z.string().min(1),
 		priority: z.number().min(1),
 		decoration: z.boolean(),
 	})
-	.required();
+	.required()
+	.extend(snapvisorChangesField);
 
 export const apiUpdateGotify = apiCreateGotify.partial().extend({
 	notificationId: z.string().min(1),
-	gotifyId: z.string().min(1),
+	// Ignored: the provider row is derived from the notification row.
+	gotifyId: z.string().optional(),
+	appToken: writeOnlySecret,
 	organizationId: z.string().optional(),
 });
 
 export const apiTestGotifyConnection = apiCreateGotify
 	.pick({
 		serverUrl: true,
-		appToken: true,
 		priority: true,
 	})
 	.extend({
+		appToken: writeOnlySecret,
+		notificationId: testNotificationId,
 		decoration: z.boolean().optional(),
 	});
 
@@ -586,25 +806,39 @@ export const apiCreateNtfy = notificationsSchema
 		serverThreshold: true,
 	})
 	.extend({
-		serverUrl: z.string().min(1),
+		serverUrl: z.string().min(1).max(MAX_URL_LENGTH, urlTooLong),
 		topic: z.string().min(1),
 		accessToken: z.string().optional(),
 		priority: z.number().min(1),
 	})
-	.required();
+	.required()
+	.extend(snapvisorChangesField);
 
 export const apiUpdateNtfy = apiCreateNtfy.partial().extend({
 	notificationId: z.string().min(1),
-	ntfyId: z.string().min(1),
+	// Ignored: the provider row is derived from the notification row.
+	ntfyId: z.string().optional(),
+	// The topic is the secret of a public server (ntfy.sh): blank keeps it.
+	topic: writeOnlySecret,
+	accessToken: writeOnlySecret,
+	// The token is optional (public topics), so a blank one means "keep":
+	// removing the stored token takes this explicit flag.
+	clearAccessToken: z.boolean().optional(),
 	organizationId: z.string().optional(),
 });
 
-export const apiTestNtfyConnection = apiCreateNtfy.pick({
-	serverUrl: true,
-	topic: true,
-	accessToken: true,
-	priority: true,
-});
+export const apiTestNtfyConnection = apiCreateNtfy
+	.pick({
+		serverUrl: true,
+		priority: true,
+	})
+	.extend({
+		topic: writeOnlySecret,
+		accessToken: writeOnlySecret,
+		// Testing without the stored token (it is about to be removed).
+		clearAccessToken: z.boolean().optional(),
+		notificationId: testNotificationId,
+	});
 
 export const apiCreateMattermost = notificationsSchema
 	.pick({
@@ -617,6 +851,7 @@ export const apiCreateMattermost = notificationsSchema
 		appDeploy: true,
 		dockerCleanup: true,
 		scheduleFailure: true,
+		snapvisorChanges: true,
 		serverThreshold: true,
 	})
 	.extend({
@@ -640,17 +875,20 @@ export const apiCreateMattermost = notificationsSchema
 
 export const apiUpdateMattermost = apiCreateMattermost.partial().extend({
 	notificationId: z.string().min(1),
-	mattermostId: z.string().min(1),
+	// Ignored: the provider row is derived from the notification row.
+	mattermostId: z.string().optional(),
+	webhookUrl: optionalWebhookUrl,
 	organizationId: z.string().optional(),
 });
 
 export const apiTestMattermostConnection = apiCreateMattermost
 	.pick({
-		webhookUrl: true,
 		channel: true,
 		username: true,
 	})
 	.extend({
+		webhookUrl: optionalWebhookUrl,
+		notificationId: testNotificationId,
 		channel: z.string().optional(),
 		username: z.string().optional(),
 	});
@@ -670,6 +908,7 @@ export const apiCreateCustom = notificationsSchema
 		appDeploy: true,
 		dockerCleanup: true,
 		scheduleFailure: true,
+		snapvisorChanges: true,
 		serverThreshold: true,
 	})
 	.extend({
@@ -679,13 +918,19 @@ export const apiCreateCustom = notificationsSchema
 
 export const apiUpdateCustom = apiCreateCustom.partial().extend({
 	notificationId: z.string().min(1),
-	customId: z.string().min(1),
+	// Ignored: the provider row is derived from the notification row.
+	customId: z.string().optional(),
+	// The endpoint often carries a token: blank keeps the stored one.
+	endpoint: writeOnlySecret,
 	organizationId: z.string().optional(),
 });
 
 export const apiTestCustomConnection = z.object({
-	endpoint: z.string().min(1),
+	endpoint: writeOnlySecret,
+	// Header values are write-only: a blank value of a header that is stored
+	// under `notificationId` keeps the stored value.
 	headers: z.record(z.string(), z.string()).optional(),
+	notificationId: testNotificationId,
 });
 
 export const apiCreateLark = notificationsSchema
@@ -704,16 +949,20 @@ export const apiCreateLark = notificationsSchema
 	.extend({
 		webhookUrl: z.string().min(1),
 	})
-	.required();
+	.required()
+	.extend(snapvisorChangesField);
 
 export const apiUpdateLark = apiCreateLark.partial().extend({
 	notificationId: z.string().min(1),
-	larkId: z.string().min(1),
+	// Ignored: the provider row is derived from the notification row.
+	larkId: z.string().optional(),
+	webhookUrl: writeOnlySecret,
 	organizationId: z.string().optional(),
 });
 
-export const apiTestLarkConnection = apiCreateLark.pick({
-	webhookUrl: true,
+export const apiTestLarkConnection = z.object({
+	webhookUrl: writeOnlySecret,
+	notificationId: testNotificationId,
 });
 
 export const apiCreateTeams = notificationsSchema
@@ -732,16 +981,20 @@ export const apiCreateTeams = notificationsSchema
 	.extend({
 		webhookUrl: z.string().min(1),
 	})
-	.required();
+	.required()
+	.extend(snapvisorChangesField);
 
 export const apiUpdateTeams = apiCreateTeams.partial().extend({
 	notificationId: z.string().min(1),
-	teamsId: z.string().min(1),
+	// Ignored: the provider row is derived from the notification row.
+	teamsId: z.string().optional(),
+	webhookUrl: writeOnlySecret,
 	organizationId: z.string().optional(),
 });
 
-export const apiTestTeamsConnection = apiCreateTeams.pick({
-	webhookUrl: true,
+export const apiTestTeamsConnection = z.object({
+	webhookUrl: writeOnlySecret,
+	notificationId: testNotificationId,
 });
 
 export const apiCreatePushover = notificationsSchema
@@ -755,6 +1008,7 @@ export const apiCreatePushover = notificationsSchema
 		appDeploy: true,
 		dockerCleanup: true,
 		scheduleFailure: true,
+		snapvisorChanges: true,
 		serverThreshold: true,
 	})
 	.extend({
@@ -775,10 +1029,11 @@ export const apiCreatePushover = notificationsSchema
 
 export const apiUpdatePushover = z.object({
 	notificationId: z.string().min(1),
-	pushoverId: z.string().min(1),
+	// Ignored: the provider row is derived from the notification row.
+	pushoverId: z.string().optional(),
 	organizationId: z.string().optional(),
-	userKey: z.string().min(1).optional(),
-	apiToken: z.string().min(1).optional(),
+	userKey: writeOnlySecret,
+	apiToken: writeOnlySecret,
 	priority: z.number().min(-2).max(2).optional(),
 	retry: z.number().min(30).nullish(),
 	expire: z.number().min(1).max(10800).nullish(),
@@ -792,12 +1047,14 @@ export const apiUpdatePushover = z.object({
 	dockerCleanup: z.boolean().optional(),
 	serverThreshold: z.boolean().optional(),
 	scheduleFailure: z.boolean().optional(),
+	snapvisorChanges: z.boolean().optional(),
 });
 
 export const apiTestPushoverConnection = z
 	.object({
-		userKey: z.string().min(1),
-		apiToken: z.string().min(1),
+		userKey: writeOnlySecret,
+		apiToken: writeOnlySecret,
+		notificationId: testNotificationId,
 		priority: z.number().min(-2).max(2),
 		retry: z.number().min(30).nullish(),
 		expire: z.number().min(1).max(10800).nullish(),

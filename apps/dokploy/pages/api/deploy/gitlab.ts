@@ -92,10 +92,10 @@ export default async function handler(
 					type: "deploy",
 					applicationType: "application",
 					server: !!app.serverId,
+					serverId: app.serverId ?? undefined,
 				};
 
 				if (IS_CLOUD && app.serverId) {
-					jobData.serverId = app.serverId;
 					deploy(jobData).catch((error) => {
 						console.error("Background deployment failed:", error);
 					});
@@ -129,10 +129,10 @@ export default async function handler(
 					type: "deploy",
 					applicationType: "compose",
 					server: !!composeApp.serverId,
+					serverId: composeApp.serverId ?? undefined,
 				};
 
 				if (IS_CLOUD && composeApp.serverId) {
-					jobData.serverId = composeApp.serverId;
 					deploy(jobData).catch((error) => {
 						console.error("Background deployment failed:", error);
 					});
@@ -197,6 +197,7 @@ export default async function handler(
 					type: "deploy",
 					applicationType: "application",
 					server: !!app.serverId,
+					serverId: app.serverId ?? undefined,
 				};
 
 				if (!shouldDeploy(app.watchPaths, modifiedFiles)) {
@@ -224,14 +225,15 @@ export default async function handler(
 					changedFiles: modifiedFiles,
 					commitMessage,
 					removeWaiting: () =>
-						coalesceQueuedApplicationDeploys(app.applicationId),
+						coalesceQueuedApplicationDeploys(app.applicationId, jobData),
 				});
 				if (!gate.deploy) continue;
 				// <<< build-policy hook
 
 				deployedCount++;
+				// A waiting deploy took this push over; nothing to enqueue.
+				if (gate.merged) continue;
 				if (IS_CLOUD && app.serverId) {
-					jobData.serverId = app.serverId;
 					deploy(jobData).catch((error) => {
 						console.error("Background deployment failed:", error);
 					});
@@ -266,6 +268,7 @@ export default async function handler(
 					type: "deploy",
 					applicationType: "compose",
 					server: !!composeApp.serverId,
+					serverId: composeApp.serverId ?? undefined,
 				};
 
 				if (!shouldDeploy(composeApp.watchPaths, modifiedFiles)) {
@@ -285,14 +288,15 @@ export default async function handler(
 					changedFiles: modifiedFiles,
 					commitMessage,
 					removeWaiting: () =>
-						coalesceQueuedComposeDeploys(composeApp.composeId),
+						coalesceQueuedComposeDeploys(composeApp.composeId, jobData),
 				});
 				if (!composeGate.deploy) continue;
 				// <<< build-policy hook
 
 				deployedCount++;
+				// A waiting deploy took this push over; nothing to enqueue.
+				if (composeGate.merged) continue;
 				if (IS_CLOUD && composeApp.serverId) {
-					jobData.serverId = composeApp.serverId;
 					deploy(jobData).catch((error) => {
 						console.error("Background deployment failed:", error);
 					});
@@ -538,12 +542,12 @@ export default async function handler(
 					type: "deploy",
 					applicationType: "application-preview",
 					server: !!app.serverId,
+					serverId: app.serverId ?? undefined,
 					previewDeploymentId,
 				};
 
 				if (previewDeploymentId) {
 					if (IS_CLOUD && app.serverId) {
-						jobData.serverId = app.serverId;
 						deploy(jobData).catch((error) => {
 							console.error("Background deployment failed:", error);
 						});
@@ -604,12 +608,12 @@ export default async function handler(
 					type: "deploy",
 					applicationType: "compose-preview",
 					server: !!composeApp.serverId,
+					serverId: composeApp.serverId ?? undefined,
 					previewDeploymentId,
 				};
 
 				if (previewDeploymentId) {
 					if (IS_CLOUD && composeApp.serverId) {
-						jobData.serverId = composeApp.serverId;
 						deploy(jobData).catch((error) => {
 							console.error("Background deployment failed:", error);
 						});

@@ -4,6 +4,7 @@ import BuildFailedEmail from "@dokploy/server/emails/emails/build-failed";
 import { render } from "@react-email/components";
 import { format } from "date-fns";
 import { and, eq } from "drizzle-orm";
+import { logSenderError } from "./log-error";
 import {
 	sendCustomNotification,
 	sendDiscordNotification,
@@ -18,6 +19,8 @@ import {
 	sendSendlyNotification,
 	sendSlackNotification,
 	sendTeamsNotification,
+	escapeHtml,
+	formatTelegramErrorMessage,
 	sendTelegramNotification,
 } from "./utils";
 
@@ -196,7 +199,7 @@ export const sendDomainVerificationFailedNotifications = async ({
 			if (telegram) {
 				await sendTelegramNotification(
 					telegram,
-					`<b>🌐 Domain DNS Verification Failed</b>\n\n<b>Project:</b> ${projectName}\n<b>Service:</b> ${serviceName}\n<b>Domain:</b> ${host}\n<b>Date:</b> ${format(date, "PP")}\n<b>Time:</b> ${format(date, "pp")}\n\n<b>Reason:</b>\n<pre>${reason}</pre>`,
+					`<b>🌐 Domain DNS Verification Failed</b>\n\n<b>Project:</b> ${escapeHtml(projectName)}\n<b>Service:</b> ${escapeHtml(serviceName)}\n<b>Domain:</b> ${escapeHtml(host)}\n<b>Date:</b> ${format(date, "PP")}\n<b>Time:</b> ${format(date, "pp")}\n\n<b>Reason:</b>\n<pre>${formatTelegramErrorMessage(reason)}</pre>`,
 					[[{ text: "Open domains", url: domainLink }]],
 				);
 			}
@@ -337,7 +340,7 @@ ${reason}
 				});
 			}
 		} catch (error) {
-			console.log(error);
+			logSenderError("domain verification", error);
 		}
 	}
 };

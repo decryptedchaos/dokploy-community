@@ -1,3 +1,4 @@
+import { trimTrailingSlashes } from "@dokploy/server/utils/integrations/base-url";
 import { join } from "node:path";
 import { paths } from "@dokploy/server/constants";
 import type { apiGitlabTestConnection } from "@dokploy/server/db/schema";
@@ -8,11 +9,13 @@ import {
 } from "@dokploy/server/services/gitlab";
 import type { ChangeRequest } from "@dokploy/server/types/change-request";
 import type { InferResultType } from "@dokploy/server/types/with";
+import { buildHeadRefCheckoutCommand } from "@dokploy/server/utils/providers/head-ref";
 import { TRPCError } from "@trpc/server";
 import { quote } from "shell-quote";
 import type { z } from "zod";
+import { getGitTokenAuthConfig } from "./git";
 
-export const refreshGitlabToken = async (gitlabProviderId: string) => {
+const refreshGitlabTokenIfExpired = async (gitlabProviderId: string) => {
 	const gitlabProvider = await findGitlabById(gitlabProviderId);
 	const currentTime = Math.floor(Date.now() / 1000);
 
@@ -65,6 +68,23 @@ export const refreshGitlabToken = async (gitlabProviderId: string) => {
 	return data;
 };
 
+// GitLab invalidates a refresh token when it is used, so concurrent callers must share one refresh
+const pendingRefreshes = new Map<
+	string,
+	ReturnType<typeof refreshGitlabTokenIfExpired>
+>();
+
+export const refreshGitlabToken = (gitlabProviderId: string) => {
+	let refresh = pendingRefreshes.get(gitlabProviderId);
+	if (!refresh) {
+		refresh = refreshGitlabTokenIfExpired(gitlabProviderId).finally(() => {
+			pendingRefreshes.delete(gitlabProviderId);
+		});
+		pendingRefreshes.set(gitlabProviderId, refresh);
+	}
+	return refresh;
+};
+
 export const haveGitlabRequirements = (gitlabProvider: Gitlab) => {
 	return !!(gitlabProvider?.accessToken && gitlabProvider?.refreshToken);
 };
@@ -110,13 +130,19 @@ const getGitlabRepoClone = (
 const getGitlabCloneUrl = (gitlab: GitlabInfo, repoClone: string) => {
 	const url = gitlab?.gitlabInternalUrl || gitlab?.gitlabUrl;
 	const isSecure = url?.startsWith("https://");
-	const cloneUrl = `http${isSecure ? "s" : ""}://oauth2:${gitlab?.accessToken}@${repoClone}`;
+	const cloneUrl = `http${isSecure ? "s" : ""}://${repoClone}`;
 	return cloneUrl;
 };
 
 interface CloneGitlabRepository {
 	appName: string;
 	gitlabBranch: string | null;
+	/**
+	 * Merge-request head ref (e.g. `refs/merge-requests/123/head`) to check out
+	 * instead of `gitlabBranch`. Set for preview deployments so merge requests
+	 * from forks build from the base project — see utils/providers/head-ref.ts.
+	 */
+	headRef?: string | null;
 	gitlabId: string | null;
 	gitlabPathNamespace: string | null;
 	enableSubmodules: boolean;
@@ -133,6 +159,7 @@ export const cloneGitlabRepository = async ({
 	const {
 		appName,
 		gitlabBranch,
+		headRef,
 		gitlabId,
 		gitlabPathNamespace,
 		enableSubmodules,
@@ -164,7 +191,18 @@ export const cloneGitlabRepository = async ({
 	const repoClone = getGitlabRepoClone(gitlab, gitlabPathNamespace);
 	const cloneUrl = getGitlabCloneUrl(gitlab, repoClone);
 	command += `echo ${quote([`Cloning Repo ${repoClone} to ${outputPath}: ✅`])};`;
-	command += `git clone --branch ${quote([String(gitlabBranch ?? "")])} --depth 1 ${enableSubmodules ? "--recurse-submodules" : ""} ${quote([String(cloneUrl ?? "")])} ${quote([String(outputPath ?? "")])} --progress;`;
+	if (headRef) {
+		command += buildHeadRefCheckoutCommand({
+			cloneUrl: String(cloneUrl ?? ""),
+			branch: String(gitlabBranch ?? ""),
+			headRef,
+			outputPath: String(outputPath ?? ""),
+			enableSubmodules,
+			authConfig: getGitTokenAuthConfig(cloneUrl, String(gitlab?.accessToken)),
+		});
+		return command;
+	}
+	command += `git ${getGitTokenAuthConfig(cloneUrl, String(gitlab?.accessToken))} clone --branch ${quote([String(gitlabBranch ?? "")])} --depth 1 ${enableSubmodules ? "--recurse-submodules" : ""} ${quote([String(cloneUrl ?? "")])} ${quote([String(outputPath ?? "")])} --progress;`;
 	return command;
 };
 
@@ -231,9 +269,9 @@ export const getGitlabBranches = async (input: {
 	const allBranches = [];
 	let page = 1;
 	const perPage = 100; // GitLab's max per page is 100
-	const baseUrl = (
+	const baseUrl = trimTrailingSlashes((
 		gitlabProvider.gitlabInternalUrl || gitlabProvider.gitlabUrl
-	).replace(/\/+$/, "");
+	));
 
 	while (true) {
 		const branchesResponse = await fetch(
@@ -308,9 +346,9 @@ export const getGitlabMergeRequests = async (input: {
 	const allMergeRequests: GitlabMergeRequest[] = [];
 	let page = 1;
 	const perPage = 100; // GitLab's max per page is 100
-	const baseUrl = (
+	const baseUrl = trimTrailingSlashes((
 		gitlabProvider.gitlabInternalUrl || gitlabProvider.gitlabUrl
-	).replace(/\/+$/, "");
+	));
 
 	while (true) {
 		const mergeRequestsResponse = await fetch(
@@ -396,9 +434,9 @@ export const validateGitlabProvider = async (gitlabProvider: Gitlab) => {
 		const allProjects = [];
 		let page = 1;
 		const perPage = 100; // GitLab's max per page is 100
-		const baseUrl = (
+		const baseUrl = trimTrailingSlashes((
 			gitlabProvider.gitlabInternalUrl || gitlabProvider.gitlabUrl
-		).replace(/\/+$/, "");
+		));
 
 		while (true) {
 			const response = await fetch(
@@ -445,9 +483,9 @@ export const checkGitlabMemberPermissions = async (
 ): Promise<{ hasWriteAccess: boolean; accessLevel: number | null }> => {
 	await refreshGitlabToken(gitlabId);
 	const gitlabProvider = await findGitlabById(gitlabId);
-	const baseUrl = (
+	const baseUrl = trimTrailingSlashes((
 		gitlabProvider.gitlabInternalUrl || gitlabProvider.gitlabUrl
-	).replace(/\/+$/, "");
+	));
 
 	// Resolve username → user ID
 	const userResponse = await fetch(
@@ -511,9 +549,9 @@ export const checkGitlabMemberPermissionsByUserId = async (
 }> => {
 	await refreshGitlabToken(gitlabId);
 	const gitlabProvider = await findGitlabById(gitlabId);
-	const baseUrl = (
+	const baseUrl = trimTrailingSlashes((
 		gitlabProvider.gitlabInternalUrl || gitlabProvider.gitlabUrl
-	).replace(/\/+$/, "");
+	));
 
 	const memberResponse = await fetch(
 		`${baseUrl}/api/v4/projects/${projectId}/members/all/${userId}`,
@@ -547,9 +585,9 @@ export const mrNoteExists = async (
 ): Promise<boolean> => {
 	await refreshGitlabToken(gitlabId);
 	const gitlabProvider = await findGitlabById(gitlabId);
-	const baseUrl = (
+	const baseUrl = trimTrailingSlashes((
 		gitlabProvider.gitlabInternalUrl || gitlabProvider.gitlabUrl
-	).replace(/\/+$/, "");
+	));
 
 	const response = await fetch(
 		`${baseUrl}/api/v4/projects/${projectId}/merge_requests/${mrIid}/notes/${noteId}`,
@@ -567,9 +605,9 @@ export const hasExistingSecurityMRNote = async (
 ): Promise<boolean> => {
 	await refreshGitlabToken(gitlabId);
 	const gitlabProvider = await findGitlabById(gitlabId);
-	const baseUrl = (
+	const baseUrl = trimTrailingSlashes((
 		gitlabProvider.gitlabInternalUrl || gitlabProvider.gitlabUrl
-	).replace(/\/+$/, "");
+	));
 
 	let page = 1;
 	while (true) {
@@ -601,9 +639,9 @@ export const createMergeRequestNote = async (
 ): Promise<number> => {
 	await refreshGitlabToken(gitlabId);
 	const gitlabProvider = await findGitlabById(gitlabId);
-	const baseUrl = (
+	const baseUrl = trimTrailingSlashes((
 		gitlabProvider.gitlabInternalUrl || gitlabProvider.gitlabUrl
-	).replace(/\/+$/, "");
+	));
 
 	const response = await fetch(
 		`${baseUrl}/api/v4/projects/${projectId}/merge_requests/${mrIid}/notes`,
@@ -634,9 +672,9 @@ export const updateMergeRequestNote = async (
 ): Promise<void> => {
 	await refreshGitlabToken(gitlabId);
 	const gitlabProvider = await findGitlabById(gitlabId);
-	const baseUrl = (
+	const baseUrl = trimTrailingSlashes((
 		gitlabProvider.gitlabInternalUrl || gitlabProvider.gitlabUrl
-	).replace(/\/+$/, "");
+	));
 
 	const response = await fetch(
 		`${baseUrl}/api/v4/projects/${projectId}/merge_requests/${mrIid}/notes/${noteId}`,

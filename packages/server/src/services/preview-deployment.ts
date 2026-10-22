@@ -9,16 +9,25 @@ import { TRPCError } from "@trpc/server";
 import { and, desc, eq } from "drizzle-orm";
 import type { z } from "zod";
 import { generatePassword } from "../templates";
-import { removeComposeDirectory } from "../utils/filesystem/directory";
 import { removeService } from "../utils/docker/utils";
-import { removeDirectoryCode } from "../utils/filesystem/directory";
+import {
+	removeComposeDirectory,
+	removeDirectoryCode,
+} from "../utils/filesystem/directory";
+import { getRemotePublicIp, isPrivateIp } from "../utils/ip";
+import {
+	hasPreviewTemplateVariable,
+	PREVIEW_WILDCARD_GUIDANCE,
+} from "../utils/preview-wildcard";
 import {
 	ExecError,
 	execAsync,
 	execAsyncRemote,
 } from "../utils/process/execAsync";
+import { buildPreviewHeadRef } from "../utils/providers/head-ref";
 import { removeTraefikConfig } from "../utils/traefik/application";
 import { manageDomain } from "../utils/traefik/domain";
+import { getPublicIpWithFallback } from "../wss/utils";
 import { findApplicationById } from "./application";
 import { findComposeById, runComposeBuild } from "./compose";
 import {
@@ -27,12 +36,6 @@ import {
 	updateDeploymentStatus,
 } from "./deployment";
 import { createDomain } from "./domain";
-import { getRemotePublicIp, isPrivateIp } from "../utils/ip";
-import {
-	hasPreviewTemplateVariable,
-	PREVIEW_WILDCARD_GUIDANCE,
-} from "../utils/preview-wildcard";
-import { getPublicIpWithFallback } from "../wss/utils";
 import { getIssueComment } from "./github";
 import {
 	createPreviewComment,
@@ -40,6 +43,7 @@ import {
 	getPreviewCommentContext,
 	updatePreviewComment,
 } from "./preview-comment";
+import { finalizePreviewBuildMetadata } from "./snapvisor";
 import { getWebServerSettings } from "./web-server-settings";
 
 export type PreviewDeployment = typeof previewDeployments.$inferSelect;
@@ -74,6 +78,28 @@ export const findPreviewDeploymentById = async (
 		});
 	}
 	return application;
+};
+
+// Only what locating the owner's host needs: the log readers call this per
+// drawer open, so it skips the domains that findPreviewDeploymentById loads.
+export const findPreviewDeploymentLogOwner = async (
+	previewDeploymentId: string,
+) => {
+	const preview = await db.query.previewDeployments.findFirst({
+		where: eq(previewDeployments.previewDeploymentId, previewDeploymentId),
+		columns: { previewDeploymentId: true },
+		with: {
+			application: { columns: { serverId: true, buildServerId: true } },
+			compose: { columns: { serverId: true } },
+		},
+	});
+	if (!preview) {
+		throw new TRPCError({
+			code: "NOT_FOUND",
+			message: "Preview Deployment not found",
+		});
+	}
+	return preview;
 };
 
 export const removePreviewDeployment = async (previewDeploymentId: string) => {
@@ -200,7 +226,10 @@ export const interpolateSubdomainTemplate = (
 ): string => {
 	return template
 		.replace(/\$\{appName\}/g, vars.appName)
-		.replace(/\$\{prNumber\}/g, vars.prNumber)
+		// Hostnames are case-insensitive and Traefik/Let's Encrypt want them in
+		// lower case; a Docker-image preview identifier may hold capitals (image
+		// tags are case-sensitive, so only the host is lowered).
+		.replace(/\$\{prNumber\}/g, vars.prNumber.toLowerCase())
 		.replace(/\$\{branchName\}/g, slugify(vars.branchName))
 		.replace(/\$\{uniqueId\}/g, vars.uniqueId);
 };
@@ -767,8 +796,21 @@ const executeComposePreview = async ({
 			// Gitea clones read `giteaBranch`, so the preview must override it too
 			// or the base branch would be built instead of the pull request tip.
 			giteaBranch: previewDeployment.branch,
+			// Fork-safe checkout: the PR/MR head ref lives on the base repository
+			// even when `branch` only exists in a fork — see
+			// utils/providers/head-ref.ts. Null falls back to the branch.
+			headRef: buildPreviewHeadRef(
+				compose.sourceType,
+				previewDeployment.pullRequestNumber,
+			),
 			suffix: previewSuffix,
 			randomize: true,
+			// The deploy guardrails are configured for the production service (its
+			// health check URL would probe the wrong deployment for a preview).
+			deployGuardrails: null,
+			// Rolling replace never applies to a preview: its deploy path stays the
+			// plain recreate, whatever the production service opted into.
+			rollingReplace: null,
 			isolatedDeployment: false,
 			isolatedDeploymentsVolume: false,
 			env: resolvePreviewTemplateVariables(
@@ -782,7 +824,19 @@ const executeComposePreview = async ({
 
 		// Previews always re-clone (latest PR tip on every synchronize) and never
 		// apply patches (patch paths key off the base compose appName).
-		await runComposeBuild(entity, deployment, { applyPatches: false });
+		await runComposeBuild(entity, deployment, {
+			applyPatches: false,
+			cancellable: false,
+		});
+
+		await finalizePreviewBuildMetadata({
+			type: "compose",
+			hasGitSource: compose.sourceType !== "raw",
+			previewDeploymentId,
+			appName: previewDeployment.appName,
+			deploymentId: deployment.deploymentId,
+			serverId: compose.serverId,
+		});
 
 		await postComposePreviewComment(
 			compose,

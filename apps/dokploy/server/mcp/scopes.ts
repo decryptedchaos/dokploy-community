@@ -115,6 +115,8 @@ const BACKUP_ROUTERS = new Set([
 const OVERRIDES: Record<string, DokployMcpScope> = {
 	"deployment.removeDeployment": "dokploy:deploy",
 	"deployment.killProcess": "dokploy:deploy",
+	// Moves a waiting deploy ahead of the queue; gated by deployment:priority.
+	"deployment.prioritizeQueued": "dokploy:deploy",
 	"application.clearDeployments": "dokploy:deploy",
 	"application.cleanQueues": "dokploy:deploy",
 	"application.dropDeployment": "dokploy:deploy",
@@ -167,7 +169,8 @@ const CREDENTIAL_QUERIES = new Set([
 	// member.user joined unprojected → user.licenseKey
 	"user.one",
 	"user.all",
-	// all 12 notification provider relations unprojected → bot tokens, API keys
+	// the provider secrets come back masked (at most the last four characters),
+	// but the rest of the provider config is still returned, so keep it admin only
 	"notification.one",
 	"notification.all",
 	"notification.getEmailProviders",

@@ -1,8 +1,13 @@
 import { db } from "@dokploy/server/db";
-import { environments } from "@dokploy/server/db/schema";
+import {
+	applications,
+	compose as composeTable,
+	environments,
+} from "@dokploy/server/db/schema";
 import { getRegistryTag } from "@dokploy/server/utils/cluster/upload";
 import { shouldDeploy } from "@dokploy/server/utils/watch-paths/should-deploy";
 import { eq } from "drizzle-orm";
+import { recordDeploymentCancelAudit } from "../deployment-cancel-audit";
 import { findRegistryByIdWithCredentials } from "../registry";
 import { recordBuildPolicyAudit } from "./audit";
 import {
@@ -65,7 +70,16 @@ export interface BuildPolicyGateUnit {
 }
 
 export type BuildPolicyGateResult =
-	| { deploy: true; coalesced: number }
+	| {
+			deploy: true;
+			/** Waiting jobs dropped from the queue (not counting a merge target). */
+			coalesced: number;
+			/**
+			 * The push was folded into a job that was already waiting (it now carries
+			 * this push's title and pinned image). The caller must not enqueue it.
+			 */
+			merged?: true;
+	  }
 	| {
 			deploy: false;
 			reason: "skip_deploy_marker" | "watch_paths";
@@ -95,6 +109,23 @@ const findOrganizationId = async (
 	return environment?.project?.organizationId ?? null;
 };
 
+/**
+ * The organization that owns `environmentId`, when it enforces remote builds;
+ * null otherwise. The one place that decides "does the policy apply here", so
+ * the enqueue gate and the callers that act on the queue outside a push cannot
+ * drift apart. Cheap cached check first: on an instance where nobody enforces,
+ * this reads nothing else.
+ */
+const findEnforcingOrganizationId = async (
+	environmentId: string,
+): Promise<string | null> => {
+	if (!(await isBuildPolicyEnforcedAnywhere())) return null;
+	const organizationId = await findOrganizationId(environmentId);
+	if (!organizationId) return null;
+	const settings = await findBuildPolicySettings(organizationId);
+	return settings?.enforceRemoteBuilds ? organizationId : null;
+};
+
 export const buildPolicyDeployGate = async ({
 	unitType,
 	unit,
@@ -108,20 +139,16 @@ export const buildPolicyDeployGate = async ({
 	changedFiles?: string[] | null;
 	commitMessage?: string | null;
 	/**
-	 * Drops this unit's still-waiting plain deploys (never its previews) and
-	 * reports how many, and ideally their titles.
+	 * Folds the incoming push into this unit's oldest still-waiting plain deploy
+	 * and drops the other waiting ones (never its previews or redeploys). Reports
+	 * how many jobs it dropped, ideally the titles of what it dropped or
+	 * replaced, and whether the push was merged.
 	 */
 	removeWaiting: CoalesceQueuedDeployInput["removeWaiting"];
 }): Promise<BuildPolicyGateResult> => {
-	// Cheap cached check first: on an instance where nobody enforces, this is
-	// the only thing the gate does.
-	if (!(await isBuildPolicyEnforcedAnywhere())) return PASS;
-
-	const organizationId = await findOrganizationId(unit.environmentId);
+	// On an instance where nobody enforces, this is the only thing the gate does.
+	const organizationId = await findEnforcingOrganizationId(unit.environmentId);
 	if (!organizationId) return PASS;
-
-	const settings = await findBuildPolicySettings(organizationId);
-	if (!settings?.enforceRemoteBuilds) return PASS;
 
 	const marker = matchedSkipDeployMarker(commitMessage);
 	if (marker) {
@@ -181,16 +208,43 @@ export const buildPolicyDeployGate = async ({
 		}
 	}
 
-	const { removed } = await coalesceQueuedDeploy({
+	const { removed, merged } = await coalesceQueuedDeploy({
 		unitType,
 		unitId: unit.unitId,
 		unitName: unit.unitName,
 		organizationId,
 		removeWaiting,
-		recordAudit: recordBuildPolicyAudit,
+		recordAudit: async (entry) => {
+			// The same drop, in the trail that needs no license. No caller is
+			// behind it: the push itself is the cause, so the actor is the system.
+			// Written first and on its own, so a failing build-policy write cannot
+			// skip it. Commit messages (`droppedTitles`) stay out of this row.
+			const { droppedTitles: _titles, ...metadata } = entry.metadata;
+			try {
+				await recordDeploymentCancelAudit({
+					organizationId: entry.organizationId,
+					action: "coalesce_drop",
+					actor: { type: "system" },
+					targetType: unitType,
+					targetId: unit.unitId,
+					targetName: unit.unitName,
+					applicationId: entry.applicationId,
+					composeId: entry.composeId,
+					metadata,
+				});
+			} catch (error) {
+				console.error(
+					"[build-policy] failed to record the cancel trail",
+					error,
+				);
+			}
+			await recordBuildPolicyAudit(entry);
+		},
 	});
 
-	return { deploy: true, coalesced: removed };
+	return merged
+		? { deploy: true, coalesced: removed, merged: true }
+		: { deploy: true, coalesced: removed };
 };
 
 /** Does this request body carry an `image` at all? Cheap, no database. */
@@ -321,11 +375,7 @@ export const rejectComposeDeployHookImage = async (
 	body: unknown,
 ): Promise<{ ok: true } | { ok: false; message: string }> => {
 	if (!deployHookBodyHasImage(body)) return { ok: true };
-	if (!(await isBuildPolicyEnforcedAnywhere())) return { ok: true };
-	const organizationId = await findOrganizationId(environmentId);
-	if (!organizationId) return { ok: true };
-	const settings = await findBuildPolicySettings(organizationId);
-	if (!settings?.enforceRemoteBuilds) return { ok: true };
+	if (!(await findEnforcingOrganizationId(environmentId))) return { ok: true };
 	return {
 		ok: false,
 		message:
@@ -334,3 +384,29 @@ export const rejectComposeDeployHookImage = async (
 };
 
 export const findUnitOrganizationId = findOrganizationId;
+
+/**
+ * Would a push for this unit coalesce right now? The same condition the gate
+ * applies before touching the queue: its organization enforces remote builds.
+ * For callers that act on the queue outside a push (the post-restore dedupe)
+ * and must not drop duplicates the policy never asked to drop.
+ */
+export const isCoalescingEnforcedForUnit = async (
+	unitType: BuildPolicyUnitType,
+	unitId: string,
+): Promise<boolean> => {
+	// Before the unit lookup, so an instance where nobody enforces reads nothing.
+	if (!(await isBuildPolicyEnforcedAnywhere())) return false;
+	const unit =
+		unitType === "application"
+			? await db.query.applications.findFirst({
+					where: eq(applications.applicationId, unitId),
+					columns: { environmentId: true },
+				})
+			: await db.query.compose.findFirst({
+					where: eq(composeTable.composeId, unitId),
+					columns: { environmentId: true },
+				});
+	if (!unit) return false;
+	return (await findEnforcingOrganizationId(unit.environmentId)) !== null;
+};

@@ -1,6 +1,9 @@
+import { randomUUID } from "node:crypto";
+import { chmod, rename } from "node:fs/promises";
 import path from "node:path";
 import { TRPCError } from "@trpc/server";
 import { eq } from "drizzle-orm";
+import { quote } from "shell-quote";
 import type { z } from "zod";
 import { IS_CLOUD, paths } from "../constants";
 import { db } from "../db";
@@ -9,7 +12,12 @@ import type {
 	updateScheduleSchema,
 } from "../db/schema/schedule";
 import { type Schedule, schedules } from "../db/schema/schedule";
-import { encodeBase64 } from "../utils/docker/utils";
+import { isPlainAppName } from "../db/schema/utils";
+import {
+	getStagedFilePath,
+	removeStagedFiles,
+	stageFiles,
+} from "../utils/docker/staging";
 import { execAsync, execAsyncRemote } from "../utils/process/execAsync";
 import { findMemberByUserId } from "./permission";
 import { findServerById } from "./server";
@@ -56,8 +64,28 @@ export const assertHostScheduleAccess = async (
 	}
 };
 
+// A dokploy-server schedule has no service or server to scope it by; its
+// organizationId is the only thing tying it to a caller.
+export const assertScheduleOrganization = (
+	ctx: { session: { activeOrganizationId: string } },
+	schedule: {
+		scheduleType: Schedule["scheduleType"];
+		organizationId: string | null;
+	},
+) => {
+	if (
+		schedule.scheduleType === "dokploy-server" &&
+		schedule.organizationId !== ctx.session.activeOrganizationId
+	) {
+		throw new TRPCError({
+			code: "UNAUTHORIZED",
+			message: "You don't have access to this schedule.",
+		});
+	}
+};
+
 export const createSchedule = async (
-	input: z.infer<typeof createScheduleSchema>,
+	input: z.infer<typeof createScheduleSchema> & { organizationId?: string },
 ) => {
 	const { scheduleId, ...rest } = input;
 	const [newSchedule] = await db
@@ -156,12 +184,16 @@ export const deleteSchedule = async (scheduleId: string) => {
 		schedule?.compose?.serverId;
 	const { SCHEDULES_PATH } = paths(!!serverId);
 
-	const fullPath = path.join(SCHEDULES_PATH, schedule?.appName || "");
-	const command = `rm -rf ${fullPath}`;
-	if (serverId) {
-		await execAsyncRemote(serverId, command);
-	} else {
-		await execAsync(command);
+	// A row written before appName stopped being client input can hold anything;
+	// never turn it into a path to delete. The row itself is still removed.
+	if (isPlainAppName(schedule?.appName || "")) {
+		const fullPath = path.join(SCHEDULES_PATH, schedule.appName);
+		const command = `rm -rf ${quote([fullPath])}`;
+		if (serverId) {
+			await execAsyncRemote(serverId, command);
+		} else {
+			await execAsync(command);
+		}
 	}
 
 	const scheduleResult = await db
@@ -178,7 +210,9 @@ export const deleteSchedule = async (scheduleId: string) => {
 };
 
 export const updateSchedule = async (
-	input: z.infer<typeof updateScheduleSchema>,
+	input: z.infer<typeof updateScheduleSchema> & {
+		organizationId?: string | null;
+	},
 ) => {
 	const { scheduleId, ...rest } = input;
 	const [updatedSchedule] = await db
@@ -205,25 +239,53 @@ export const updateSchedule = async (
 };
 
 const handleScript = async (schedule: Schedule) => {
+	if (!isPlainAppName(schedule?.appName || "")) {
+		throw new TRPCError({
+			code: "BAD_REQUEST",
+			message: "Invalid schedule app name",
+		});
+	}
+	// A server schedule without a server has nowhere to write its script.
+	const serverId =
+		schedule.scheduleType === "server" ? schedule.serverId : null;
+	if (schedule.scheduleType === "server" && !serverId) return;
+
 	const { SCHEDULES_PATH } = paths(!!schedule?.serverId);
-	const fullPath = path.join(SCHEDULES_PATH, schedule?.appName || "");
+	const fullPath = path.join(SCHEDULES_PATH, schedule.appName);
+	const scriptPath = path.join(fullPath, "script.sh");
 
 	// Add PID and Schedule ID echo by default to all scripts
 	const scriptWithPid = `echo "PID: $$ | Schedule ID: ${schedule.scheduleId}"
 ${schedule?.script || ""}`;
 
-	const encodedContent = encodeBase64(scriptWithPid);
-	const script = `
-	 	 mkdir -p ${fullPath}
-	 	 rm -f ${fullPath}/script.sh
-		 touch ${fullPath}/script.sh
-		 chmod +x ${fullPath}/script.sh
-		 echo "${encodedContent}" | base64 -d > ${fullPath}/script.sh
-	`;
-
-	if (schedule?.scheduleType === "dokploy-server") {
-		await execAsync(script);
-	} else if (schedule?.scheduleType === "server") {
-		await execAsyncRemote(schedule?.serverId || "", script);
+	// The script can hold secrets and be large, so it never goes through a
+	// command line (it would show in the host's process list, and one shell
+	// argument is capped at 128 KB). It is staged as a 0600 file through SFTP /
+	// fs, then moved over the script in one step, so a run never sees half of it.
+	const staged = getStagedFilePath({
+		directory: fullPath,
+		kind: "schedule-script",
+		// Per call: two saves of one schedule at once must not share a file.
+		deploymentId: `${schedule.scheduleId}-${randomUUID()}`,
+	});
+	try {
+		await stageFiles({
+			serverId,
+			directory: fullPath,
+			files: [{ path: staged, content: scriptWithPid }],
+		});
+		if (serverId) {
+			const qStaged = quote([staged]);
+			await execAsyncRemote(
+				serverId,
+				`chmod 700 ${qStaged} && mv -f ${qStaged} ${quote([scriptPath])}`,
+			);
+		} else {
+			await chmod(staged, 0o700);
+			await rename(staged, scriptPath);
+		}
+	} catch (error) {
+		await removeStagedFiles(serverId, [staged]);
+		throw error;
 	}
 };

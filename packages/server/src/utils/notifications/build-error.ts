@@ -1,10 +1,14 @@
 import { db } from "@dokploy/server/db";
 import { notifications } from "@dokploy/server/db/schema";
 import BuildFailedEmail from "@dokploy/server/emails/emails/build-failed";
+import { reportDeployFailureToUptimely } from "@dokploy/server/services/uptimely-deploy";
 import { render } from "@react-email/components";
 import { format } from "date-fns";
 import { and, eq } from "drizzle-orm";
+import { logSenderError } from "./log-error";
 import {
+	escapeHtml,
+	formatTelegramErrorMessage,
 	sendCustomNotification,
 	sendDiscordNotification,
 	sendEmailNotification,
@@ -28,6 +32,8 @@ interface Props {
 	errorMessage: string;
 	buildLink: string;
 	organizationId: string;
+	/** Id of the application or compose service, for the Uptimely channel. */
+	serviceId?: string;
 }
 
 /**
@@ -46,7 +52,26 @@ export const sendBuildErrorNotifications = async ({
 	errorMessage,
 	buildLink,
 	organizationId,
+	serviceId,
 }: Props) => {
+	// Declares an Uptimely incident. Not awaited and never rejects, so it
+	// cannot delay the failure handling of the deploy.
+	if (
+		serviceId &&
+		(applicationType === "application" || applicationType === "compose")
+	) {
+		void reportDeployFailureToUptimely(
+			{
+				organizationId,
+				serviceType: applicationType,
+				serviceId,
+				projectName,
+				serviceName: applicationName,
+			},
+			{ errorMessage, buildLink },
+		);
+	}
+
 	const date = new Date();
 	const unixDate = ~~(Number(date) / 1000);
 	const notificationList = await db.query.notifications.findMany({
@@ -223,7 +248,7 @@ export const sendBuildErrorNotifications = async ({
 
 				await sendTelegramNotification(
 					telegram,
-					`<b>⚠️ Build Failed</b>\n\n<b>Project:</b> ${projectName}\n<b>Application:</b> ${applicationName}\n<b>Type:</b> ${applicationType}\n<b>Date:</b> ${format(date, "PP")}\n<b>Time:</b> ${format(date, "pp")}\n\n<b>Error:</b>\n<pre>${errorMessage}</pre>`,
+					`<b>⚠️ Build Failed</b>\n\n<b>Project:</b> ${escapeHtml(projectName)}\n<b>Application:</b> ${escapeHtml(applicationName)}\n<b>Type:</b> ${escapeHtml(applicationType)}\n<b>Date:</b> ${format(date, "PP")}\n<b>Time:</b> ${format(date, "pp")}\n\n<b>Error:</b>\n<pre>${formatTelegramErrorMessage(errorMessage)}</pre>`,
 					inlineButton,
 				);
 			}
@@ -460,7 +485,7 @@ ${errorMessage}
 				});
 			}
 		} catch (error) {
-			console.log(error);
+			logSenderError("build error", error);
 		}
 	}
 };

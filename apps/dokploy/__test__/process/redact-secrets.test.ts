@@ -29,6 +29,28 @@ describe("redactSecrets", () => {
 		expect(redacted).toContain('echo "[REDACTED]" | base64 -d');
 	});
 
+	it("redacts the registry password piped into docker login", () => {
+		const password = "s3cr3t-registry-pass";
+		const command =
+			`echo ok; printf %s '${password}' | docker login 'localhost:5000' -u 'dokploy' --password-stdin || exit 1;` +
+			`printf %s '${password}' | docker login --username AWS --password-stdin 'x.dkr.ecr.eu-west-1.amazonaws.com';` +
+			`printf %s hunter2 | docker login reg.example.com -u u --password-stdin`;
+
+		const redacted = redactSecrets(command);
+
+		expect(redacted).not.toContain(password);
+		expect(redacted).not.toContain("hunter2");
+		expect(redacted).toContain(
+			`printf %s "[REDACTED]" | docker login 'localhost:5000' -u 'dokploy' --password-stdin`,
+		);
+		expect(redacted).toContain("docker login --username AWS");
+	});
+
+	it("does not touch an ordinary printf pipe", () => {
+		const command = "printf %s 'hello' | base64";
+		expect(redactSecrets(command)).toBe(command);
+	});
+
 	it("leaves commands without secrets untouched", () => {
 		const command =
 			"git clone --branch main --depth 1 git@github.com:org/repo.git /tmp/code";
@@ -158,6 +180,20 @@ describe("redactSecrets", () => {
 		);
 	});
 
+	it("redacts the Authorization header a git clone passes with -c", () => {
+		const b64 = Buffer.from("oauth2:ghs_FAKEFAKEFAKEFAKEFAKEFAKEFAKE").toString(
+			"base64",
+		);
+		// shell-quote single-quotes the value (it contains a space).
+		const redacted = redactSecrets(
+			`git -c 'http.https://github.com/.extraHeader=Authorization: Basic ${b64}' clone --branch main --depth 1 https://github.com/org/repo.git /code`,
+		);
+		expect(redacted).not.toContain(b64);
+		expect(redacted).toContain(
+			"git -c 'http.https://github.com/.extraHeader=Authorization: [REDACTED]' clone --branch main",
+		);
+	});
+
 	it("redacts basic-auth passwords in any URL but keeps user and host", () => {
 		const redacted = redactSecrets(
 			"docker login https://user:appPassFAKE@registry.example.com:5000/v2/",
@@ -203,7 +239,9 @@ describe("redactSecrets shell-quoted values (#5519)", () => {
 	});
 
 	it("redacts a DB password assignment that contains escaped quotes", () => {
-		const redacted = redactSecrets(String.raw`PGPASSWORD="p\"a ss" pg_dump -h db`);
+		const redacted = redactSecrets(
+			String.raw`PGPASSWORD="p\"a ss" pg_dump -h db`,
+		);
 		expect(redacted).not.toContain("ss");
 		expect(redacted).toBe('PGPASSWORD="[REDACTED]" pg_dump -h db');
 	});

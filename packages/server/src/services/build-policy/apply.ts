@@ -1,11 +1,13 @@
 import { posix } from "node:path";
 import { paths } from "@dokploy/server/constants";
 import type { BuildPolicySettings } from "@dokploy/server/db/schema";
-import { getSafeRegistryLoginCommand } from "@dokploy/server/db/schema";
-import { getECRAuthToken } from "@dokploy/server/utils/aws/ecr";
-import { getRegistryTag } from "@dokploy/server/utils/cluster/upload";
+import {
+	getRegistryTag,
+	loginDockerRegistry,
+} from "@dokploy/server/utils/cluster/upload";
 import { encodeBase64 } from "@dokploy/server/utils/docker/utils";
 import { sendBuildErrorNotifications } from "@dokploy/server/utils/notifications/build-error";
+import { buildDockerPushWithRetry } from "@dokploy/server/utils/process/dockerPush";
 import {
 	execAsync,
 	execAsyncRemote,
@@ -215,6 +217,7 @@ export const reportBuildPolicyPlanFailure = async ({
 			projectName: application.environment.project.name,
 			applicationName: application.name,
 			applicationType: "application",
+			serviceId: application.applicationId,
 			errorMessage: message,
 			buildLink: `${await getDokployUrl()}/dashboard/project/${application.environment.projectId}/services/application/${application.applicationId}?tab=deployments`,
 			organizationId: application.environment.project.organizationId,
@@ -285,21 +288,10 @@ export const getBuildPolicyPushCommand = async (
 	if (!plan.enforced || !plan.registryId || !plan.repository) return "";
 
 	const registry = await findRegistryByIdWithCredentials(plan.registryId);
-	let ecrAuthPassword: string | undefined;
-	if (registry.registryType === "awsEcr") {
-		const token = await getECRAuthToken({
-			awsAccessKeyId: registry.awsAccessKeyId || "",
-			awsSecretAccessKey: registry.awsSecretAccessKey || "",
-			awsRegion: registry.awsRegion || "",
-		});
-		ecrAuthPassword = token.password;
-	}
-	const loginCommand = getSafeRegistryLoginCommand({
-		registryType: registry.registryType,
-		registryUrl: registry.registryUrl,
-		username: registry.username,
-		password: registry.password,
-		ecrAuthPassword,
+	// Logged in on the build host ahead of the script, so the password travels
+	// on stdin instead of in the script's command line.
+	const configDir = await loginDockerRegistry(registry, serverId, {
+		isolated: true,
 	});
 
 	const { APPLICATIONS_PATH } = paths(!!serverId);
@@ -316,15 +308,11 @@ if [ -z "$DOKPLOY_BP_SHA" ]; then
 	exit 1;
 fi
 DOKPLOY_BP_TAG=${quote([repository])}:"$DOKPLOY_BP_SHA" ;
-${loginCommand} || {
-	echo "❌ [build-policy] Registry login failed" ;
-	exit 1;
-}
 docker tag ${quote([`${appName}:latest`])} "$DOKPLOY_BP_TAG" || {
 	echo "❌ [build-policy] Tagging the image by sha failed" ;
 	exit 1;
 }
-docker push "$DOKPLOY_BP_TAG" || {
+${buildDockerPushWithRetry('"$DOKPLOY_BP_TAG"', configDir, { rawShellRef: true })} || {
 	echo "❌ [build-policy] Pushing the image to the organization registry failed" ;
 	exit 1;
 }

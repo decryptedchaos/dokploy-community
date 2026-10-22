@@ -33,6 +33,7 @@ import {
 	resolvePermissions,
 } from "@dokploy/server/services/permission";
 import { hasValidLicense } from "@dokploy/server/services/proprietary/license-key";
+import { logSenderError } from "@dokploy/server/utils/notifications/log-error";
 import { TRPCError } from "@trpc/server";
 import * as bcrypt from "bcrypt";
 import { and, asc, desc, eq, gt, ne } from "drizzle-orm";
@@ -767,15 +768,32 @@ export const userRouter = createTRPCRouter({
 				return;
 			}
 
+			// Both belong to the active organization: another organization's mail
+			// provider is never used, and its invitation link is never mailed.
 			const notification = await findNotificationById(input.notificationId);
+			if (notification.organizationId !== ctx.session.activeOrganizationId) {
+				throw new TRPCError({
+					code: "UNAUTHORIZED",
+					message: "You are not authorized to use this notification",
+				});
+			}
 
 			const email = notification.email;
 			const resend = notification.resend;
 			const sendly = notification.sendly;
 
 			const currentInvitation = await db.query.invitation.findFirst({
-				where: eq(invitation.id, input.invitationId),
+				where: and(
+					eq(invitation.id, input.invitationId),
+					eq(invitation.organizationId, ctx.session.activeOrganizationId),
+				),
 			});
+			if (!currentInvitation) {
+				throw new TRPCError({
+					code: "NOT_FOUND",
+					message: "Invitation not found",
+				});
+			}
 
 			if (!email && !resend && !sendly) {
 				throw new TRPCError({
@@ -824,7 +842,7 @@ export const userRouter = createTRPCRouter({
 					);
 				}
 			} catch (error) {
-				console.log(error);
+				logSenderError("invitation email", error);
 				throw error;
 			}
 			await audit(ctx, {

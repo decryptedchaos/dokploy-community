@@ -1,5 +1,6 @@
 import {
 	buildSendlyTestEmail,
+	containsUrlRedaction,
 	createCustomNotification,
 	createDiscordNotification,
 	createEmailNotification,
@@ -14,10 +15,25 @@ import {
 	createSlackNotification,
 	createTeamsNotification,
 	createTelegramNotification,
+	createUptimelyChannelNotification,
+	EMAIL_SERVER_CHANGE_NEEDS_PASSWORD_MESSAGE,
 	findNotificationById,
+	GOTIFY_URL_CHANGE_NEEDS_TOKEN_MESSAGE,
 	getWebServerSettings,
-	IS_CLOUD,
+	isRedactedUrlEcho,
+	isSameIntegrationBaseUrl,
+	isSameSmtpServer,
+	maskApiKey,
+	maskHeaderValues,
+	maskWebhookUrl,
+	mergeCustomHeaders,
+	NOTIFLY_URL_CHANGE_NEEDS_KEY_MESSAGE,
+	NTFY_URL_CHANGE_NEEDS_TOKEN_MESSAGE,
+	NTFY_URL_CHANGE_NEEDS_TOPIC_MESSAGE,
+	REDACTED_URL_MESSAGE,
+	redactUrl,
 	removeNotificationById,
+	SENDLY_URL_CHANGE_NEEDS_KEY_MESSAGE,
 	sendCustomNotification,
 	sendDiscordNotification,
 	sendEmailNotification,
@@ -33,6 +49,8 @@ import {
 	sendSlackNotification,
 	sendTeamsNotification,
 	sendTelegramNotification,
+	testUptimelyConnection,
+	UPTIMELY_URL_CHANGE_NEEDS_KEY_MESSAGE,
 	updateCustomNotification,
 	updateDiscordNotification,
 	updateEmailNotification,
@@ -47,8 +65,13 @@ import {
 	updateSlackNotification,
 	updateTeamsNotification,
 	updateTelegramNotification,
+	updateUptimelyChannelNotification,
 } from "@dokploy/server";
 import { db } from "@dokploy/server/db";
+import {
+	checkPermission,
+	type PermissionCtx,
+} from "@dokploy/server/services/permission";
 import { TRPCError } from "@trpc/server";
 import { desc, eq, sql } from "drizzle-orm";
 import { z } from "zod";
@@ -58,6 +81,7 @@ import {
 	withPermission,
 } from "@/server/api/trpc";
 import { audit } from "@/server/api/utils/audit";
+import { redactSecrets, testFailure } from "@/server/api/utils/redact-secrets";
 import {
 	apiCreateCustom,
 	apiCreateDiscord,
@@ -73,6 +97,7 @@ import {
 	apiCreateSlack,
 	apiCreateTeams,
 	apiCreateTelegram,
+	apiCreateUptimelyChannel,
 	apiFindOneNotification,
 	apiTestCustomConnection,
 	apiTestDiscordConnection,
@@ -88,6 +113,7 @@ import {
 	apiTestSlackConnection,
 	apiTestTeamsConnection,
 	apiTestTelegramConnection,
+	apiTestUptimelyChannelConnection,
 	apiUpdateCustom,
 	apiUpdateDiscord,
 	apiUpdateEmail,
@@ -102,9 +128,235 @@ import {
 	apiUpdateSlack,
 	apiUpdateTeams,
 	apiUpdateTelegram,
+	apiUpdateUptimelyChannel,
 	notifications,
 	server,
 } from "@/server/db/schema";
+
+/**
+ * Client-safe view of a notification: every provider secret is write-only, so
+ * it is replaced by its masked form (`<field>Masked`) and never returned. The
+ * senders read the provider rows from the database, not this view.
+ */
+type NotificationWithProviders = Awaited<
+	ReturnType<typeof findNotificationById>
+>;
+
+type Masked<C, K extends keyof C> = Omit<C, K> & {
+	[P in K as `${P & string}Masked`]: string | null;
+};
+
+const maskSecrets = <C extends object, K extends keyof C & string>(
+	row: C | null | undefined,
+	keys: readonly K[],
+	mask: (value: string) => string = maskApiKey,
+) => {
+	if (!row) return null;
+	const visible: Record<string, unknown> = {
+		...(row as Record<string, unknown>),
+	};
+	for (const key of keys) {
+		const value = visible[key];
+		delete visible[key];
+		visible[`${key}Masked`] =
+			typeof value === "string" && value ? mask(value) : null;
+	}
+	return visible as Masked<C, K>;
+};
+
+/**
+ * A non-secret URL may still carry userinfo or a token in its query: those are
+ * redacted, and a plain URL is returned as stored. The edit form sends the
+ * redacted URL back when it was not edited, which keeps the stored one.
+ */
+const redactUrlField = <C extends Record<K, string>, K extends string>(
+	row: C | null,
+	key: K,
+) => (row ? ({ ...row, [key]: redactUrl(row[key]) } as C) : null);
+
+const maskCustomHeaders = (row: NotificationWithProviders["custom"]) => {
+	if (!row) return null;
+	const { headers, endpoint, ...visible } = row;
+	return {
+		...visible,
+		// The endpoint often carries a token (in the path or the query).
+		endpointMasked: endpoint ? maskWebhookUrl(endpoint) : null,
+		headersMasked: maskHeaderValues(headers),
+	};
+};
+
+const presentNotification = (notification: NotificationWithProviders) => {
+	const {
+		slack,
+		telegram,
+		discord,
+		email,
+		resend,
+		sendly,
+		notifly,
+		uptimelyChannel,
+		gotify,
+		ntfy,
+		mattermost,
+		custom,
+		lark,
+		pushover,
+		teams,
+		...rest
+	} = notification;
+	return {
+		...rest,
+		slack: maskSecrets(slack, ["webhookUrl"], maskWebhookUrl),
+		telegram: maskSecrets(telegram, ["botToken"]),
+		discord: maskSecrets(discord, ["webhookUrl"], maskWebhookUrl),
+		// A password is hidden entirely: no tail, unlike the keys and tokens.
+		email: maskSecrets(email, ["password"], () => "••••••••"),
+		resend: maskSecrets(resend, ["apiKey"]),
+		sendly: redactUrlField(maskSecrets(sendly, ["apiKey"]), "baseUrl"),
+		notifly: redactUrlField(maskSecrets(notifly, ["apiKey"]), "baseUrl"),
+		uptimelyChannel: redactUrlField(
+			maskSecrets(uptimelyChannel, ["apiKey"]),
+			"baseUrl",
+		),
+		gotify: redactUrlField(maskSecrets(gotify, ["appToken"]), "serverUrl"),
+		// On a public server (ntfy.sh) the topic is the secret.
+		ntfy: redactUrlField(
+			maskSecrets(ntfy, ["accessToken", "topic"]),
+			"serverUrl",
+		),
+		mattermost: maskSecrets(mattermost, ["webhookUrl"], maskWebhookUrl),
+		custom: maskCustomHeaders(custom),
+		lark: maskSecrets(lark, ["webhookUrl"], maskWebhookUrl),
+		pushover: maskSecrets(pushover, ["userKey", "apiToken"]),
+		teams: maskSecrets(teams, ["webhookUrl"], maskWebhookUrl),
+	};
+};
+
+/**
+ * The notification behind the "Test Notification" button of the edit form. It
+ * must belong to the caller's organization: the stored secrets of another
+ * organization's notification are never borrowed. Borrowing one also takes the
+ * "update" permission: a test only needs "create", which never reads a secret.
+ */
+const findOwnNotification = async (
+	notificationId: string,
+	ctx: PermissionCtx,
+) => {
+	await checkPermission(ctx, { notification: ["update"] });
+	const notification = await findNotificationById(notificationId);
+	if (notification.organizationId !== ctx.session.activeOrganizationId) {
+		throw new TRPCError({
+			code: "UNAUTHORIZED",
+			message: "You are not authorized to access this notification",
+		});
+	}
+	return notification;
+};
+
+/**
+ * Edit flow of the "Test Notification" button: the secret field is blank
+ * (write-only), so the test uses the stored secret of the caller's own
+ * notification, never one sent by the client. A typed secret is used as is.
+ */
+const resolveStoredSecret = async (params: {
+	value?: string | null;
+	notificationId?: string;
+	ctx: PermissionCtx;
+	stored: (
+		notification: NotificationWithProviders,
+	) => string | null | undefined;
+	missing: string;
+	/** Collects the secret in use, to keep it out of an error message. */
+	track?: Array<string | undefined>;
+}) => {
+	if (params.value) {
+		params.track?.push(params.value);
+		return params.value;
+	}
+	if (params.notificationId) {
+		const notification = await findOwnNotification(
+			params.notificationId,
+			params.ctx,
+		);
+		const stored = params.stored(notification);
+		if (stored) {
+			params.track?.push(stored);
+			return stored;
+		}
+	}
+	throw new TRPCError({
+		code: "BAD_REQUEST",
+		message: `${params.missing} is required to test the connection`,
+	});
+};
+
+/**
+ * The URL of the "Test Notification" button of the edit form: the form shows
+ * the redacted URL, and sends it back when it was not edited. That echo is the
+ * stored URL of the caller's own notification (collected in `track` to keep it
+ * out of an error message, it may carry userinfo). A masked URL that is not
+ * that echo cannot be called.
+ */
+const resolveTestUrl = async (params: {
+	url: string;
+	notificationId?: string;
+	ctx: PermissionCtx;
+	stored: (
+		notification: NotificationWithProviders,
+	) => string | null | undefined;
+	track?: Array<string | undefined>;
+}) => {
+	if (!containsUrlRedaction(params.url)) return params.url;
+	if (params.notificationId) {
+		const notification = await findOwnNotification(
+			params.notificationId,
+			params.ctx,
+		);
+		const stored = params.stored(notification);
+		if (stored && isRedactedUrlEcho(params.url, stored)) {
+			params.track?.push(stored);
+			return stored;
+		}
+	}
+	throw new TRPCError({ code: "BAD_REQUEST", message: REDACTED_URL_MESSAGE });
+};
+
+/**
+ * Same for a secret that is sent to a configurable server URL: the stored
+ * secret is never replayed against a URL typed into the form. A provider
+ * without a stored secret (an optional token) resolves to undefined.
+ */
+const resolveChannelTestKey = async (params: {
+	apiKey?: string;
+	notificationId?: string;
+	baseUrl: string;
+	ctx: PermissionCtx;
+	storedChannel: (
+		notification: NotificationWithProviders,
+	) => { apiKey: string; baseUrl: string } | null;
+	urlChangeMessage: string;
+	/** Collects the secret in use, to keep it out of an error message. */
+	track?: Array<string | undefined>;
+}) => {
+	if (params.apiKey || !params.notificationId) {
+		params.track?.push(params.apiKey);
+		return params.apiKey;
+	}
+	const notification = await findOwnNotification(
+		params.notificationId,
+		params.ctx,
+	);
+	const channel = params.storedChannel(notification);
+	if (!channel) return undefined;
+	if (!isSameIntegrationBaseUrl(params.baseUrl, channel.baseUrl)) {
+		throw new TRPCError({
+			code: "BAD_REQUEST",
+			message: params.urlChangeMessage,
+		});
+	}
+	params.track?.push(channel.apiKey);
+	return channel.apiKey;
+};
 
 export const notificationRouter = createTRPCRouter({
 	createSlack: withPermission("notification", "create")
@@ -118,11 +370,16 @@ export const notificationRouter = createTRPCRouter({
 					resourceName: input.name,
 				});
 			} catch (error) {
-				console.log(error);
+				// Not the error itself: a database error carries the bound values,
+				// which are the provider secrets.
+				console.error(
+					"Error creating the Slack notification:",
+					error instanceof Error ? error.name : "unknown error",
+				);
+				if (error instanceof TRPCError) throw error;
 				throw new TRPCError({
 					code: "BAD_REQUEST",
 					message: "Error creating the notification",
-					cause: error,
 				});
 			}
 		}),
@@ -149,24 +406,37 @@ export const notificationRouter = createTRPCRouter({
 				});
 				return result;
 			} catch (error) {
-				throw error;
+				// Keep the specific refusals (not found, "enter the secret again").
+				if (error instanceof TRPCError) throw error;
+				throw new TRPCError({
+					code: "BAD_REQUEST",
+					message: "Error updating the notification",
+				});
 			}
 		}),
 	testSlackConnection: withPermission("notification", "create")
 		.input(apiTestSlackConnection)
-		.mutation(async ({ input }) => {
+		.mutation(async ({ input, ctx }) => {
+			const secrets: Array<string | undefined> = [];
 			try {
-				await sendSlackNotification(input, {
-					channel: input.channel,
-					text: "Hi, From Dokploy 👋",
+				const webhookUrl = await resolveStoredSecret({
+					track: secrets,
+					value: input.webhookUrl,
+					notificationId: input.notificationId,
+					ctx,
+					stored: (notification) => notification.slack?.webhookUrl,
+					missing: "A webhook URL",
 				});
+				await sendSlackNotification(
+					{ webhookUrl, channel: input.channel },
+					{
+						channel: input.channel,
+						text: "Hi, From Dokploy 👋",
+					},
+				);
 				return true;
 			} catch (error) {
-				throw new TRPCError({
-					code: "BAD_REQUEST",
-					message: `${error instanceof Error ? error.message : "Unknown error"}`,
-					cause: error,
-				});
+				throw testFailure(error, secrets);
 			}
 		}),
 	createTelegram: withPermission("notification", "create")
@@ -183,10 +453,10 @@ export const notificationRouter = createTRPCRouter({
 					resourceName: input.name,
 				});
 			} catch (error) {
+				if (error instanceof TRPCError) throw error;
 				throw new TRPCError({
 					code: "BAD_REQUEST",
 					message: "Error creating the notification",
-					cause: error,
 				});
 			}
 		}),
@@ -214,25 +484,38 @@ export const notificationRouter = createTRPCRouter({
 				});
 				return result;
 			} catch (error) {
+				// Keep the specific refusals (not found, "enter the secret again").
+				if (error instanceof TRPCError) throw error;
 				throw new TRPCError({
 					code: "BAD_REQUEST",
 					message: "Error updating the notification",
-					cause: error,
 				});
 			}
 		}),
 	testTelegramConnection: withPermission("notification", "create")
 		.input(apiTestTelegramConnection)
-		.mutation(async ({ input }) => {
+		.mutation(async ({ input, ctx }) => {
+			const secrets: Array<string | undefined> = [];
 			try {
-				await sendTelegramNotification(input, "Hi, From Dokploy 👋");
+				const botToken = await resolveStoredSecret({
+					track: secrets,
+					value: input.botToken,
+					notificationId: input.notificationId,
+					ctx,
+					stored: (notification) => notification.telegram?.botToken,
+					missing: "A bot token",
+				});
+				await sendTelegramNotification(
+					{
+						botToken,
+						chatId: input.chatId,
+						messageThreadId: input.messageThreadId,
+					},
+					"Hi, From Dokploy 👋",
+				);
 				return true;
 			} catch (error) {
-				throw new TRPCError({
-					code: "BAD_REQUEST",
-					message: "Error testing the notification",
-					cause: error,
-				});
+				throw testFailure(error, secrets);
 			}
 		}),
 	createDiscord: withPermission("notification", "create")
@@ -249,10 +532,10 @@ export const notificationRouter = createTRPCRouter({
 					resourceName: input.name,
 				});
 			} catch (error) {
+				if (error instanceof TRPCError) throw error;
 				throw new TRPCError({
 					code: "BAD_REQUEST",
 					message: "Error creating the notification",
-					cause: error,
 				});
 			}
 		}),
@@ -280,34 +563,43 @@ export const notificationRouter = createTRPCRouter({
 				});
 				return result;
 			} catch (error) {
+				// Keep the specific refusals (not found, "enter the secret again").
+				if (error instanceof TRPCError) throw error;
 				throw new TRPCError({
 					code: "BAD_REQUEST",
 					message: "Error updating the notification",
-					cause: error,
 				});
 			}
 		}),
 
 	testDiscordConnection: withPermission("notification", "create")
 		.input(apiTestDiscordConnection)
-		.mutation(async ({ input }) => {
+		.mutation(async ({ input, ctx }) => {
+			const secrets: Array<string | undefined> = [];
 			try {
+				const webhookUrl = await resolveStoredSecret({
+					track: secrets,
+					value: input.webhookUrl,
+					notificationId: input.notificationId,
+					ctx,
+					stored: (notification) => notification.discord?.webhookUrl,
+					missing: "A webhook URL",
+				});
 				const decorate = (decoration: string, text: string) =>
 					`${input.decoration ? decoration : ""} ${text}`.trim();
 
-				await sendDiscordNotification(input, {
-					title: decorate(">", "`🤚` - Test Notification"),
-					description: decorate(">", "Hi, From Dokploy 👋"),
-					color: 0xf3f7f4,
-				});
+				await sendDiscordNotification(
+					{ webhookUrl, decoration: input.decoration },
+					{
+						title: decorate(">", "`🤚` - Test Notification"),
+						description: decorate(">", "Hi, From Dokploy 👋"),
+						color: 0xf3f7f4,
+					},
+				);
 
 				return true;
 			} catch (error) {
-				throw new TRPCError({
-					code: "BAD_REQUEST",
-					message: `${error instanceof Error ? error.message : "Unknown error"}`,
-					cause: error,
-				});
+				throw testFailure(error, secrets);
 			}
 		}),
 	createEmail: withPermission("notification", "create")
@@ -321,10 +613,10 @@ export const notificationRouter = createTRPCRouter({
 					resourceName: input.name,
 				});
 			} catch (error) {
+				if (error instanceof TRPCError) throw error;
 				throw new TRPCError({
 					code: "BAD_REQUEST",
 					message: "Error creating the notification",
-					cause: error,
 				});
 			}
 		}),
@@ -351,29 +643,47 @@ export const notificationRouter = createTRPCRouter({
 				});
 				return result;
 			} catch (error) {
+				// Keep the specific refusals (not found, "enter the secret again").
+				if (error instanceof TRPCError) throw error;
 				throw new TRPCError({
 					code: "BAD_REQUEST",
 					message: "Error updating the notification",
-					cause: error,
 				});
 			}
 		}),
 	testEmailConnection: withPermission("notification", "create")
 		.input(apiTestEmailConnection)
-		.mutation(async ({ input }) => {
+		.mutation(async ({ input, ctx }) => {
+			const secrets: Array<string | undefined> = [input.password];
 			try {
+				// Only spaces is blank, as when saving. Not trimmed otherwise.
+				let password = input.password?.trim() ? input.password : undefined;
+				if (!password && input.notificationId && input.username) {
+					const notification = await findOwnNotification(
+						input.notificationId,
+						ctx,
+					);
+					const stored = notification.email;
+					if (stored?.password) {
+						// The stored password is never sent to a server typed into the form.
+						if (!isSameSmtpServer(input, stored)) {
+							throw new TRPCError({
+								code: "BAD_REQUEST",
+								message: EMAIL_SERVER_CHANGE_NEEDS_PASSWORD_MESSAGE,
+							});
+						}
+						password = stored.password;
+						secrets.push(stored.password);
+					}
+				}
 				await sendEmailNotification(
-					input,
+					{ ...input, password },
 					"Test Email",
 					"<p>Hi, From Dokploy 👋</p>",
 				);
 				return true;
 			} catch (error) {
-				throw new TRPCError({
-					code: "BAD_REQUEST",
-					message: `${error instanceof Error ? error.message : "Unknown error"}`,
-					cause: error,
-				});
+				throw testFailure(error, secrets);
 			}
 		}),
 	createResend: withPermission("notification", "create")
@@ -387,10 +697,10 @@ export const notificationRouter = createTRPCRouter({
 					resourceName: input.name,
 				});
 			} catch (error) {
+				if (error instanceof TRPCError) throw error;
 				throw new TRPCError({
 					code: "BAD_REQUEST",
 					message: "Error creating the notification",
-					cause: error,
 				});
 			}
 		}),
@@ -417,29 +727,35 @@ export const notificationRouter = createTRPCRouter({
 				});
 				return result;
 			} catch (error) {
+				// Keep the specific refusals (not found, "enter the secret again").
+				if (error instanceof TRPCError) throw error;
 				throw new TRPCError({
 					code: "BAD_REQUEST",
 					message: "Error updating the notification",
-					cause: error,
 				});
 			}
 		}),
 	testResendConnection: withPermission("notification", "create")
 		.input(apiTestResendConnection)
-		.mutation(async ({ input }) => {
+		.mutation(async ({ input, ctx }) => {
+			const secrets: Array<string | undefined> = [];
 			try {
+				const apiKey = await resolveStoredSecret({
+					track: secrets,
+					value: input.apiKey,
+					notificationId: input.notificationId,
+					ctx,
+					stored: (notification) => notification.resend?.apiKey,
+					missing: "An API key",
+				});
 				await sendResendNotification(
-					input,
+					{ ...input, apiKey },
 					"Test Email",
 					"<p>Hi, From Dokploy 👋</p>",
 				);
 				return true;
 			} catch (error) {
-				throw new TRPCError({
-					code: "BAD_REQUEST",
-					message: `${error instanceof Error ? error.message : "Unknown error"}`,
-					cause: error,
-				});
+				throw testFailure(error, secrets);
 			}
 		}),
 	createSendly: withPermission("notification", "create")
@@ -453,10 +769,10 @@ export const notificationRouter = createTRPCRouter({
 					resourceName: input.name,
 				});
 			} catch (error) {
+				if (error instanceof TRPCError) throw error;
 				throw new TRPCError({
 					code: "BAD_REQUEST",
 					message: "Error creating the notification",
-					cause: error,
 				});
 			}
 		}),
@@ -483,26 +799,47 @@ export const notificationRouter = createTRPCRouter({
 				});
 				return result;
 			} catch (error) {
+				// Keep the specific refusals (not found, "enter the key again").
+				if (error instanceof TRPCError) throw error;
 				throw new TRPCError({
 					code: "BAD_REQUEST",
 					message: "Error updating the notification",
-					cause: error,
 				});
 			}
 		}),
 	testSendlyConnection: withPermission("notification", "create")
 		.input(apiTestSendlyConnection)
-		.mutation(async ({ input }) => {
+		.mutation(async ({ input, ctx }) => {
+			const secrets: Array<string | undefined> = [];
 			try {
+				const baseUrl = await resolveTestUrl({
+					track: secrets,
+					url: input.baseUrl,
+					notificationId: input.notificationId,
+					ctx,
+					stored: (notification) => notification.sendly?.baseUrl,
+				});
+				const apiKey = await resolveChannelTestKey({
+					track: secrets,
+					apiKey: input.apiKey,
+					notificationId: input.notificationId,
+					baseUrl,
+					ctx,
+					storedChannel: (notification) => notification.sendly,
+					urlChangeMessage: SENDLY_URL_CHANGE_NEEDS_KEY_MESSAGE,
+				});
+				if (!apiKey) {
+					throw new Error("An API key is required to test the connection");
+				}
 				const { subject, html } = buildSendlyTestEmail();
-				await sendSendlyNotification(input, subject, html);
+				await sendSendlyNotification(
+					{ ...input, baseUrl, apiKey },
+					subject,
+					html,
+				);
 				return true;
 			} catch (error) {
-				throw new TRPCError({
-					code: "BAD_REQUEST",
-					message: `${error instanceof Error ? error.message : "Unknown error"}`,
-					cause: error,
-				});
+				throw testFailure(error, secrets);
 			}
 		}),
 	createNotifly: withPermission("notification", "create")
@@ -519,10 +856,10 @@ export const notificationRouter = createTRPCRouter({
 					resourceName: input.name,
 				});
 			} catch (error) {
+				if (error instanceof TRPCError) throw error;
 				throw new TRPCError({
 					code: "BAD_REQUEST",
 					message: "Error creating the notification",
-					cause: error,
 				});
 			}
 		}),
@@ -549,29 +886,142 @@ export const notificationRouter = createTRPCRouter({
 				});
 				return result;
 			} catch (error) {
+				// Keep the specific refusals (not found, "enter the key again").
+				if (error instanceof TRPCError) throw error;
 				throw new TRPCError({
 					code: "BAD_REQUEST",
 					message: "Error updating the notification",
-					cause: error,
 				});
 			}
 		}),
 	testNotiflyConnection: withPermission("notification", "create")
 		.input(apiTestNotiflyConnection)
-		.mutation(async ({ input }) => {
+		.mutation(async ({ input, ctx }) => {
+			const secrets: Array<string | undefined> = [];
 			try {
-				await sendNotiflyNotification(input, {
-					event: "test",
-					message: "Hi, From Dokploy 👋",
-					timestamp: new Date().toISOString(),
+				const baseUrl = await resolveTestUrl({
+					track: secrets,
+					url: input.baseUrl,
+					notificationId: input.notificationId,
+					ctx,
+					stored: (notification) => notification.notifly?.baseUrl,
 				});
+				const apiKey = await resolveChannelTestKey({
+					track: secrets,
+					apiKey: input.apiKey,
+					notificationId: input.notificationId,
+					baseUrl,
+					ctx,
+					storedChannel: (notification) => notification.notifly,
+					urlChangeMessage: NOTIFLY_URL_CHANGE_NEEDS_KEY_MESSAGE,
+				});
+				if (!apiKey) {
+					throw new Error("An API key is required to test the connection");
+				}
+				await sendNotiflyNotification(
+					{ ...input, baseUrl, apiKey },
+					{
+						event: "test",
+						message: "Hi, From Dokploy 👋",
+						timestamp: new Date().toISOString(),
+					},
+				);
 				return true;
 			} catch (error) {
+				throw testFailure(error, secrets);
+			}
+		}),
+	createUptimely: withPermission("notification", "create")
+		.input(apiCreateUptimelyChannel)
+		.mutation(async ({ input, ctx }) => {
+			try {
+				await createUptimelyChannelNotification(
+					input,
+					ctx.session.activeOrganizationId,
+				);
+				await audit(ctx, {
+					action: "create",
+					resourceType: "notification",
+					resourceName: input.name,
+				});
+			} catch (error) {
+				if (error instanceof TRPCError) throw error;
 				throw new TRPCError({
 					code: "BAD_REQUEST",
-					message: `${error instanceof Error ? error.message : "Unknown error"}`,
-					cause: error,
+					message: "Error creating the notification",
 				});
+			}
+		}),
+	updateUptimely: withPermission("notification", "update")
+		.input(apiUpdateUptimelyChannel)
+		.mutation(async ({ input, ctx }) => {
+			try {
+				const notification = await findNotificationById(input.notificationId);
+				if (notification.organizationId !== ctx.session.activeOrganizationId) {
+					throw new TRPCError({
+						code: "UNAUTHORIZED",
+						message: "You are not authorized to update this notification",
+					});
+				}
+				const result = await updateUptimelyChannelNotification({
+					...input,
+					organizationId: ctx.session.activeOrganizationId,
+				});
+				await audit(ctx, {
+					action: "update",
+					resourceType: "notification",
+					resourceId: input.notificationId,
+					resourceName: notification.name,
+				});
+				return result;
+			} catch (error) {
+				// Keep the specific refusals (not found, "enter the key again").
+				if (error instanceof TRPCError) throw error;
+				throw new TRPCError({
+					code: "BAD_REQUEST",
+					message: "Error updating the notification",
+				});
+			}
+		}),
+	// Read-only on purpose: a test must not declare an incident in a real
+	// Uptimely project. It proves the key, the base URL and the project id.
+	testUptimelyConnection: withPermission("notification", "create")
+		.input(apiTestUptimelyChannelConnection)
+		.mutation(async ({ input, ctx }) => {
+			const secrets: Array<string | undefined> = [];
+			try {
+				const baseUrl = await resolveTestUrl({
+					track: secrets,
+					url: input.baseUrl,
+					notificationId: input.notificationId,
+					ctx,
+					stored: (notification) => notification.uptimelyChannel?.baseUrl,
+				});
+				const apiKey = await resolveChannelTestKey({
+					track: secrets,
+					apiKey: input.apiKey,
+					notificationId: input.notificationId,
+					baseUrl,
+					ctx,
+					storedChannel: (notification) => notification.uptimelyChannel,
+					urlChangeMessage: UPTIMELY_URL_CHANGE_NEEDS_KEY_MESSAGE,
+				});
+				if (!apiKey) {
+					throw new Error("An API key is required to test the connection");
+				}
+				const result = await testUptimelyConnection({
+					apiKey,
+					projectId: input.projectId,
+					baseUrl,
+				});
+				if (!result.projectFound) {
+					throw new Error(
+						"The API key cannot access that project id. Check the project id.",
+					);
+				}
+				return true;
+			} catch (error) {
+				throw testFailure(error, secrets);
 			}
 		}),
 	remove: withPermission("notification", "delete")
@@ -612,10 +1062,10 @@ export const notificationRouter = createTRPCRouter({
 					message: "You are not authorized to access this notification",
 				});
 			}
-			return notification;
+			return presentNotification(notification);
 		}),
 	all: withPermission("notification", "read").query(async ({ ctx }) => {
-		return await db.query.notifications.findMany({
+		const list = await db.query.notifications.findMany({
 			with: {
 				slack: true,
 				telegram: true,
@@ -624,6 +1074,7 @@ export const notificationRouter = createTRPCRouter({
 				resend: true,
 				sendly: true,
 				notifly: true,
+				uptimelyChannel: true,
 				gotify: true,
 				ntfy: true,
 				mattermost: true,
@@ -635,6 +1086,7 @@ export const notificationRouter = createTRPCRouter({
 			orderBy: desc(notifications.createdAt),
 			where: eq(notifications.organizationId, ctx.session.activeOrganizationId),
 		});
+		return list.map(presentNotification);
 	}),
 	receiveNotification: publicProcedure
 		.input(
@@ -689,11 +1141,12 @@ export const notificationRouter = createTRPCRouter({
 					...input,
 					ServerName,
 				});
-			} catch (error) {
+			} catch {
+				// Public endpoint: every failure answers the same, so a caller cannot
+				// tell a bad token from a good one whose send failed.
 				throw new TRPCError({
 					code: "BAD_REQUEST",
 					message: "Error sending the notification",
-					cause: error,
 				});
 			}
 		}),
@@ -708,10 +1161,10 @@ export const notificationRouter = createTRPCRouter({
 					resourceName: input.name,
 				});
 			} catch (error) {
+				if (error instanceof TRPCError) throw error;
 				throw new TRPCError({
 					code: "BAD_REQUEST",
 					message: "Error creating the notification",
-					cause: error,
 				});
 			}
 		}),
@@ -720,10 +1173,7 @@ export const notificationRouter = createTRPCRouter({
 		.mutation(async ({ input, ctx }) => {
 			try {
 				const notification = await findNotificationById(input.notificationId);
-				if (
-					IS_CLOUD &&
-					notification.organizationId !== ctx.session.activeOrganizationId
-				) {
+				if (notification.organizationId !== ctx.session.activeOrganizationId) {
 					throw new TRPCError({
 						code: "UNAUTHORIZED",
 						message: "You are not authorized to update this notification",
@@ -741,24 +1191,55 @@ export const notificationRouter = createTRPCRouter({
 				});
 				return result;
 			} catch (error) {
-				throw error;
+				// Keep the specific refusals (not found, "enter the secret again").
+				if (error instanceof TRPCError) throw error;
+				throw new TRPCError({
+					code: "BAD_REQUEST",
+					message: "Error updating the notification",
+				});
 			}
 		}),
 	testGotifyConnection: withPermission("notification", "create")
 		.input(apiTestGotifyConnection)
-		.mutation(async ({ input }) => {
+		.mutation(async ({ input, ctx }) => {
 			try {
+				const serverUrl = await resolveTestUrl({
+					url: input.serverUrl,
+					notificationId: input.notificationId,
+					ctx,
+					stored: (notification) => notification.gotify?.serverUrl,
+				});
+				const appToken = await resolveChannelTestKey({
+					apiKey: input.appToken,
+					notificationId: input.notificationId,
+					baseUrl: serverUrl,
+					ctx,
+					storedChannel: (notification) =>
+						notification.gotify
+							? {
+									apiKey: notification.gotify.appToken,
+									baseUrl: notification.gotify.serverUrl,
+								}
+							: null,
+					urlChangeMessage: GOTIFY_URL_CHANGE_NEEDS_TOKEN_MESSAGE,
+				});
+				if (!appToken) {
+					throw new TRPCError({
+						code: "BAD_REQUEST",
+						message: "An app token is required to test the connection",
+					});
+				}
 				await sendGotifyNotification(
-					input,
+					{ ...input, serverUrl, appToken },
 					"Test Notification",
 					"Hi, From Dokploy 👋",
 				);
 				return true;
 			} catch (error) {
+				if (error instanceof TRPCError) throw error;
 				throw new TRPCError({
 					code: "BAD_REQUEST",
 					message: "Error testing the notification",
-					cause: error,
 				});
 			}
 		}),
@@ -773,10 +1254,10 @@ export const notificationRouter = createTRPCRouter({
 					resourceName: input.name,
 				});
 			} catch (error) {
+				if (error instanceof TRPCError) throw error;
 				throw new TRPCError({
 					code: "BAD_REQUEST",
 					message: "Error creating the notification",
-					cause: error,
 				});
 			}
 		}),
@@ -785,10 +1266,7 @@ export const notificationRouter = createTRPCRouter({
 		.mutation(async ({ input, ctx }) => {
 			try {
 				const notification = await findNotificationById(input.notificationId);
-				if (
-					IS_CLOUD &&
-					notification.organizationId !== ctx.session.activeOrganizationId
-				) {
+				if (notification.organizationId !== ctx.session.activeOrganizationId) {
 					throw new TRPCError({
 						code: "UNAUTHORIZED",
 						message: "You are not authorized to update this notification",
@@ -806,15 +1284,73 @@ export const notificationRouter = createTRPCRouter({
 				});
 				return result;
 			} catch (error) {
-				throw error;
+				// Keep the specific refusals (not found, "enter the secret again").
+				if (error instanceof TRPCError) throw error;
+				throw new TRPCError({
+					code: "BAD_REQUEST",
+					message: "Error updating the notification",
+				});
 			}
 		}),
 	testNtfyConnection: withPermission("notification", "create")
 		.input(apiTestNtfyConnection)
-		.mutation(async ({ input }) => {
+		.mutation(async ({ input, ctx }) => {
+			// Secrets in use (typed or borrowed), to keep out of an error message.
+			const secrets: Array<string | undefined> = [
+				input.topic,
+				input.accessToken,
+			];
 			try {
+				const serverUrl = await resolveTestUrl({
+					track: secrets,
+					url: input.serverUrl,
+					notificationId: input.notificationId,
+					ctx,
+					stored: (notification) => notification.ntfy?.serverUrl,
+				});
+				// The topic is write-only: a blank one is the stored topic, which is
+				// never sent to a server typed into the form.
+				const topic = await resolveChannelTestKey({
+					apiKey: input.topic,
+					notificationId: input.notificationId,
+					baseUrl: serverUrl,
+					ctx,
+					storedChannel: (notification) =>
+						notification.ntfy
+							? {
+									apiKey: notification.ntfy.topic,
+									baseUrl: notification.ntfy.serverUrl,
+								}
+							: null,
+					urlChangeMessage: NTFY_URL_CHANGE_NEEDS_TOPIC_MESSAGE,
+				});
+				if (!topic) {
+					throw new TRPCError({
+						code: "BAD_REQUEST",
+						message: "Topic is required to test the connection",
+					});
+				}
+				secrets.push(topic);
+				// The token is optional (public topics): without one, none is sent.
+				const accessToken = await resolveChannelTestKey({
+					apiKey: input.accessToken,
+					notificationId: input.clearAccessToken
+						? undefined
+						: input.notificationId,
+					baseUrl: serverUrl,
+					ctx,
+					storedChannel: (notification) =>
+						notification.ntfy?.accessToken
+							? {
+									apiKey: notification.ntfy.accessToken,
+									baseUrl: notification.ntfy.serverUrl,
+								}
+							: null,
+					urlChangeMessage: NTFY_URL_CHANGE_NEEDS_TOKEN_MESSAGE,
+				});
+				secrets.push(accessToken);
 				await sendNtfyNotification(
-					input,
+					{ ...input, serverUrl, topic, accessToken: accessToken || null },
 					"Test Notification",
 					"",
 					"view, visit Dokploy on Github, https://github.com/dokploy/dokploy, clear=true;",
@@ -822,13 +1358,13 @@ export const notificationRouter = createTRPCRouter({
 				);
 				return true;
 			} catch (error) {
+				if (error instanceof TRPCError) throw error;
 				throw new TRPCError({
 					code: "BAD_REQUEST",
 					message:
 						error instanceof Error
-							? `Error testing the notification: ${error.message}`
+							? `Error testing the notification: ${redactSecrets(error.message, secrets)}`
 							: "Error testing the notification",
-					cause: error,
 				});
 			}
 		}),
@@ -846,10 +1382,10 @@ export const notificationRouter = createTRPCRouter({
 					resourceName: input.name,
 				});
 			} catch (error) {
+				if (error instanceof TRPCError) throw error;
 				throw new TRPCError({
 					code: "BAD_REQUEST",
 					message: "Error creating the notification",
-					cause: error,
 				});
 			}
 		}),
@@ -858,10 +1394,7 @@ export const notificationRouter = createTRPCRouter({
 		.mutation(async ({ input, ctx }) => {
 			try {
 				const notification = await findNotificationById(input.notificationId);
-				if (
-					IS_CLOUD &&
-					notification.organizationId !== ctx.session.activeOrganizationId
-				) {
+				if (notification.organizationId !== ctx.session.activeOrganizationId) {
 					throw new TRPCError({
 						code: "UNAUTHORIZED",
 						message: "You are not authorized to update this notification",
@@ -879,24 +1412,39 @@ export const notificationRouter = createTRPCRouter({
 				});
 				return result;
 			} catch (error) {
-				throw error;
+				// Keep the specific refusals (not found, "enter the secret again").
+				if (error instanceof TRPCError) throw error;
+				throw new TRPCError({
+					code: "BAD_REQUEST",
+					message: "Error updating the notification",
+				});
 			}
 		}),
 	testMattermostConnection: withPermission("notification", "create")
 		.input(apiTestMattermostConnection)
-		.mutation(async ({ input }) => {
+		.mutation(async ({ input, ctx }) => {
 			try {
-				await sendMattermostNotification(input, {
-					text: "Hi, From Dokploy 👋",
-					channel: input.channel,
-					username: input.username || "Dokploy Bot",
+				const webhookUrl = await resolveStoredSecret({
+					value: input.webhookUrl,
+					notificationId: input.notificationId,
+					ctx,
+					stored: (notification) => notification.mattermost?.webhookUrl,
+					missing: "A webhook URL",
 				});
+				await sendMattermostNotification(
+					{ webhookUrl, channel: input.channel, username: input.username },
+					{
+						text: "Hi, From Dokploy 👋",
+						channel: input.channel,
+						username: input.username || "Dokploy Bot",
+					},
+				);
 				return true;
 			} catch (error) {
+				if (error instanceof TRPCError) throw error;
 				throw new TRPCError({
 					code: "BAD_REQUEST",
 					message: "Error testing the notification",
-					cause: error,
 				});
 			}
 		}),
@@ -911,10 +1459,10 @@ export const notificationRouter = createTRPCRouter({
 					resourceName: input.name,
 				});
 			} catch (error) {
+				if (error instanceof TRPCError) throw error;
 				throw new TRPCError({
 					code: "BAD_REQUEST",
 					message: "Error creating the notification",
-					cause: error,
 				});
 			}
 		}),
@@ -941,25 +1489,63 @@ export const notificationRouter = createTRPCRouter({
 				});
 				return result;
 			} catch (error) {
-				throw error;
+				// Keep the specific refusals (not found, "enter the secret again").
+				if (error instanceof TRPCError) throw error;
+				throw new TRPCError({
+					code: "BAD_REQUEST",
+					message: "Error updating the notification",
+				});
 			}
 		}),
 	testCustomConnection: withPermission("notification", "create")
 		.input(apiTestCustomConnection)
-		.mutation(async ({ input }) => {
+		.mutation(async ({ input, ctx }) => {
+			// Secrets in use (typed or borrowed), to keep out of an error message.
+			const secrets: Array<string | undefined> = [input.endpoint];
 			try {
-				await sendCustomNotification(input, {
-					title: "Test Notification",
-					message: "Hi, From Dokploy 👋",
-					timestamp: new Date().toISOString(),
-				});
+				let endpoint = input.endpoint;
+				let headers = input.headers;
+				if (input.notificationId && (!endpoint || headers)) {
+					const notification = await findOwnNotification(
+						input.notificationId,
+						ctx,
+					);
+					const stored = notification.custom;
+					// A blank endpoint is the stored one.
+					endpoint = endpoint || stored?.endpoint;
+					if (headers) {
+						// Blank header values are the stored ones, which are never sent
+						// to an endpoint typed into the form.
+						headers = mergeCustomHeaders(
+							headers,
+							stored?.headers,
+							!stored ||
+								!endpoint ||
+								!isSameIntegrationBaseUrl(endpoint, stored.endpoint),
+						);
+					}
+					secrets.push(
+						stored?.endpoint,
+						...Object.values(stored?.headers ?? {}),
+					);
+				}
+				if (!endpoint) {
+					throw new TRPCError({
+						code: "BAD_REQUEST",
+						message: "Endpoint is required to test the connection",
+					});
+				}
+				await sendCustomNotification(
+					{ endpoint, headers },
+					{
+						title: "Test Notification",
+						message: "Hi, From Dokploy 👋",
+						timestamp: new Date().toISOString(),
+					},
+				);
 				return true;
 			} catch (error) {
-				throw new TRPCError({
-					code: "BAD_REQUEST",
-					message: `${error instanceof Error ? error.message : "Unknown error"}`,
-					cause: error,
-				});
+				throw testFailure(error, secrets);
 			}
 		}),
 	createLark: withPermission("notification", "create")
@@ -973,10 +1559,10 @@ export const notificationRouter = createTRPCRouter({
 					resourceName: input.name,
 				});
 			} catch (error) {
+				if (error instanceof TRPCError) throw error;
 				throw new TRPCError({
 					code: "BAD_REQUEST",
 					message: "Error creating the notification",
-					cause: error,
 				});
 			}
 		}),
@@ -985,10 +1571,7 @@ export const notificationRouter = createTRPCRouter({
 		.mutation(async ({ input, ctx }) => {
 			try {
 				const notification = await findNotificationById(input.notificationId);
-				if (
-					IS_CLOUD &&
-					notification.organizationId !== ctx.session.activeOrganizationId
-				) {
+				if (notification.organizationId !== ctx.session.activeOrganizationId) {
 					throw new TRPCError({
 						code: "UNAUTHORIZED",
 						message: "You are not authorized to update this notification",
@@ -1006,26 +1589,39 @@ export const notificationRouter = createTRPCRouter({
 				});
 				return result;
 			} catch (error) {
-				throw error;
+				// Keep the specific refusals (not found, "enter the secret again").
+				if (error instanceof TRPCError) throw error;
+				throw new TRPCError({
+					code: "BAD_REQUEST",
+					message: "Error updating the notification",
+				});
 			}
 		}),
 	testLarkConnection: withPermission("notification", "create")
 		.input(apiTestLarkConnection)
-		.mutation(async ({ input }) => {
+		.mutation(async ({ input, ctx }) => {
+			const secrets: Array<string | undefined> = [];
 			try {
-				await sendLarkNotification(input, {
-					msg_type: "text",
-					content: {
-						text: "Hi, From Dokploy 👋",
-					},
+				const webhookUrl = await resolveStoredSecret({
+					track: secrets,
+					value: input.webhookUrl,
+					notificationId: input.notificationId,
+					ctx,
+					stored: (notification) => notification.lark?.webhookUrl,
+					missing: "A webhook URL",
 				});
+				await sendLarkNotification(
+					{ webhookUrl },
+					{
+						msg_type: "text",
+						content: {
+							text: "Hi, From Dokploy 👋",
+						},
+					},
+				);
 				return true;
 			} catch (error) {
-				throw new TRPCError({
-					code: "BAD_REQUEST",
-					message: "Error testing the notification",
-					cause: error,
-				});
+				throw testFailure(error, secrets);
 			}
 		}),
 	createTeams: withPermission("notification", "create")
@@ -1039,10 +1635,10 @@ export const notificationRouter = createTRPCRouter({
 					resourceName: input.name,
 				});
 			} catch (error) {
+				if (error instanceof TRPCError) throw error;
 				throw new TRPCError({
 					code: "BAD_REQUEST",
 					message: "Error creating the notification",
-					cause: error,
 				});
 			}
 		}),
@@ -1051,10 +1647,7 @@ export const notificationRouter = createTRPCRouter({
 		.mutation(async ({ input, ctx }) => {
 			try {
 				const notification = await findNotificationById(input.notificationId);
-				if (
-					IS_CLOUD &&
-					notification.organizationId !== ctx.session.activeOrganizationId
-				) {
+				if (notification.organizationId !== ctx.session.activeOrganizationId) {
 					throw new TRPCError({
 						code: "UNAUTHORIZED",
 						message: "You are not authorized to update this notification",
@@ -1072,24 +1665,37 @@ export const notificationRouter = createTRPCRouter({
 				});
 				return result;
 			} catch (error) {
-				throw error;
+				// Keep the specific refusals (not found, "enter the secret again").
+				if (error instanceof TRPCError) throw error;
+				throw new TRPCError({
+					code: "BAD_REQUEST",
+					message: "Error updating the notification",
+				});
 			}
 		}),
 	testTeamsConnection: withPermission("notification", "create")
 		.input(apiTestTeamsConnection)
-		.mutation(async ({ input }) => {
+		.mutation(async ({ input, ctx }) => {
+			const secrets: Array<string | undefined> = [];
 			try {
-				await sendTeamsNotification(input, {
-					title: "🤚 Test Notification",
-					facts: [{ name: "Message", value: "Hi, From Dokploy 👋" }],
+				const webhookUrl = await resolveStoredSecret({
+					track: secrets,
+					value: input.webhookUrl,
+					notificationId: input.notificationId,
+					ctx,
+					stored: (notification) => notification.teams?.webhookUrl,
+					missing: "A webhook URL",
 				});
+				await sendTeamsNotification(
+					{ webhookUrl },
+					{
+						title: "🤚 Test Notification",
+						facts: [{ name: "Message", value: "Hi, From Dokploy 👋" }],
+					},
+				);
 				return true;
 			} catch (error) {
-				throw new TRPCError({
-					code: "BAD_REQUEST",
-					message: `${error instanceof Error ? error.message : "Unknown error"}`,
-					cause: error,
-				});
+				throw testFailure(error, secrets);
 			}
 		}),
 	createPushover: withPermission("notification", "create")
@@ -1106,10 +1712,10 @@ export const notificationRouter = createTRPCRouter({
 					resourceName: input.name,
 				});
 			} catch (error) {
+				if (error instanceof TRPCError) throw error;
 				throw new TRPCError({
 					code: "BAD_REQUEST",
 					message: "Error creating the notification",
-					cause: error,
 				});
 			}
 		}),
@@ -1118,10 +1724,7 @@ export const notificationRouter = createTRPCRouter({
 		.mutation(async ({ input, ctx }) => {
 			try {
 				const notification = await findNotificationById(input.notificationId);
-				if (
-					IS_CLOUD &&
-					notification.organizationId !== ctx.session.activeOrganizationId
-				) {
+				if (notification.organizationId !== ctx.session.activeOrganizationId) {
 					throw new TRPCError({
 						code: "UNAUTHORIZED",
 						message: "You are not authorized to update this notification",
@@ -1139,39 +1742,56 @@ export const notificationRouter = createTRPCRouter({
 				});
 				return result;
 			} catch (error) {
-				throw error;
+				// Keep the specific refusals (not found, "enter the secret again").
+				if (error instanceof TRPCError) throw error;
+				throw new TRPCError({
+					code: "BAD_REQUEST",
+					message: "Error updating the notification",
+				});
 			}
 		}),
 	testPushoverConnection: withPermission("notification", "create")
 		.input(apiTestPushoverConnection)
-		.mutation(async ({ input }) => {
+		.mutation(async ({ input, ctx }) => {
 			try {
+				const userKey = await resolveStoredSecret({
+					value: input.userKey,
+					notificationId: input.notificationId,
+					ctx,
+					stored: (notification) => notification.pushover?.userKey,
+					missing: "A user key",
+				});
+				const apiToken = await resolveStoredSecret({
+					value: input.apiToken,
+					notificationId: input.notificationId,
+					ctx,
+					stored: (notification) => notification.pushover?.apiToken,
+					missing: "An API token",
+				});
 				await sendPushoverNotification(
-					input,
+					{ ...input, userKey, apiToken },
 					"Test Notification",
 					"Hi, From Dokploy 👋",
 				);
 				return true;
 			} catch (error) {
+				if (error instanceof TRPCError) throw error;
 				throw new TRPCError({
 					code: "BAD_REQUEST",
 					message: "Error testing the notification",
-					cause: error,
 				});
 			}
 		}),
 	getEmailProviders: withPermission("notification", "read").query(
 		async ({ ctx }) => {
+			// The invitation dialog only lists the providers by name, so the
+			// provider rows (API keys, SMTP password) are never loaded.
 			return await db.query.notifications.findMany({
+				columns: { notificationId: true, name: true, notificationType: true },
 				where: eq(
 					notifications.organizationId,
 					ctx.session.activeOrganizationId,
 				),
-				with: {
-					email: true,
-					resend: true,
-					sendly: true,
-				},
 			});
 		},
 	),

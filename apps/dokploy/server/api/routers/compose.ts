@@ -1,8 +1,10 @@
 import { dirname, join } from "node:path";
 import {
 	addDomainToCompose,
+	assertComposeBuildSettings,
 	// build-policy hook: required-checks support check at the API boundary.
 	assertRequiredChecksSupportedForUpdate,
+	cancelBuildServerDeploymentsForService,
 	clearOldDeployments,
 	cloneBitbucketRepository,
 	cloneCompose,
@@ -26,6 +28,7 @@ import {
 	findProjectById,
 	findServerById,
 	getAccessibleServerIds,
+	getComposeBuildOverridePath,
 	getComposeContainer,
 	getContainerLogs,
 	getWebServerSettings,
@@ -41,6 +44,7 @@ import {
 	removeComposeDirectory,
 	removeDeploymentsByComposeId,
 	removeDomainById,
+	removeUptimelyServiceRows,
 	scanServiceForTransfer,
 	startCompose,
 	stopCompose,
@@ -48,6 +52,10 @@ import {
 	updateDeploymentStatus,
 } from "@dokploy/server";
 import { db } from "@dokploy/server/db";
+import {
+	assertComposeRollingSettings,
+	getComposeRollingReport,
+} from "@dokploy/server/services/compose-rolling";
 import { canEditDeployGitSource } from "@dokploy/server/services/git-provider";
 import {
 	addNewService,
@@ -89,6 +97,7 @@ import {
 import type { DeploymentJob } from "@/server/queues/queue-types";
 import {
 	cleanQueuesByCompose,
+	keepOldestQueuesByCompose,
 	killDockerBuild,
 	myQueue,
 } from "@/server/queues/queueSetup";
@@ -101,6 +110,11 @@ import {
 import { generatePassword } from "@/templates/utils";
 import { createTRPCRouter, protectedProcedure } from "../trpc";
 import { audit } from "../utils/audit";
+import { auditCancel } from "../utils/cancel-audit";
+import {
+	assertCanPrioritize,
+	recordPriorityUse,
+} from "../utils/deploy-priority";
 
 export const composeRouter = createTRPCRouter({
 	create: protectedProcedure
@@ -218,6 +232,42 @@ export const composeRouter = createTRPCRouter({
 				service: ["create"],
 			});
 
+			// Build server: the caller must be allowed to use the server (same check
+			// as applications), and the settings as a whole must be valid. Checked
+			// against the merged result, so clearing the registry on its own, or
+			// adding a custom command to a build-server compose, is refused too.
+			if (
+				input.buildServerId !== undefined ||
+				input.buildRegistryId !== undefined ||
+				input.command !== undefined
+			) {
+				if (input.buildServerId) {
+					const accessibleIds = await getAccessibleServerIds(ctx.session);
+					if (!accessibleIds.has(input.buildServerId)) {
+						throw new TRPCError({
+							code: "UNAUTHORIZED",
+							message: "You are not authorized to access this build server",
+						});
+					}
+				}
+				const existing = await findComposeById(input.composeId);
+				await assertComposeBuildSettings(
+					{
+						buildServerId:
+							input.buildServerId !== undefined
+								? input.buildServerId
+								: existing.buildServerId,
+						buildRegistryId:
+							input.buildRegistryId !== undefined
+								? input.buildRegistryId
+								: existing.buildRegistryId,
+						command:
+							input.command !== undefined ? input.command : existing.command,
+					},
+					ctx.session.activeOrganizationId,
+				);
+			}
+
 			// >>> build-policy hook: refuse a required check this compose unit can
 			// never satisfy, here rather than on every deploy. Same rule and the
 			// same message as the application path. See finding F in the round-2
@@ -247,6 +297,17 @@ export const composeRouter = createTRPCRouter({
 				}
 			}
 			// <<< build-policy hook
+
+			// Rolling replace: every selected service must be able to roll on the
+			// compose as it is now (deploys re-check, a save is where the user
+			// hears about it).
+			if (input.rollingReplace) {
+				await assertComposeRollingSettings(
+					input.composeId,
+					input.rollingReplace,
+					{ composeType: input.composeType, command: input.command },
+				);
+			}
 
 			const updated = await updateCompose(input.composeId, input);
 			await audit(ctx, {
@@ -309,6 +370,10 @@ export const composeRouter = createTRPCRouter({
 				.where(eq(composeTable.composeId, input.composeId))
 				.returning();
 
+			await removeUptimelyServiceRows([
+				{ serviceType: "compose", serviceId: input.composeId },
+			]);
+
 			if (!IS_CLOUD) {
 				await cleanQueuesByCompose(input.composeId);
 			}
@@ -334,12 +399,61 @@ export const composeRouter = createTRPCRouter({
 			return composeResult;
 		}),
 	cleanQueues: protectedProcedure
-		.input(apiFindCompose)
+		.input(
+			apiFindCompose.extend({
+				mode: z
+					.enum(["all", "keepOldest"])
+					.default("all")
+					.describe(
+						'"all" (default) removes every waiting job of the compose stack, PR previews included. "keepOldest" keeps the earliest waiting job of each group of duplicates and removes the later ones; only plain deploy and redeploy jobs of the compose stack are considered (never PR previews), deploy and redeploy are separate, and jobs that differ in freshVolumes, pinnedImage or priority are not duplicates. Active jobs are never touched. keepOldest returns { kept, removed }, each a list of { jobId, enqueuedAt, type }.',
+					),
+			}),
+		)
 		.mutation(async ({ input, ctx }) => {
 			await checkServicePermissionAndAccess(ctx, input.composeId, {
-				deployment: ["create"],
+				deployment: ["cancel"],
 			});
-			await cleanQueuesByCompose(input.composeId);
+			const compose = await findComposeById(input.composeId);
+			// The jobs are already gone once the queue helper returns, so a failing
+			// audit must not turn the answer into an error and hide what was removed.
+			const auditRemoved = async (
+				action: "clean_queue" | "keep_oldest_queue",
+				metadata: Record<string, unknown>,
+			) => {
+				await auditCancel(ctx, {
+					action,
+					targetType: "compose",
+					targetId: compose.composeId,
+					targetName: compose.appName,
+					composeId: compose.composeId,
+					metadata,
+				});
+				try {
+					await audit(ctx, {
+						action: "cancel",
+						resourceType: "compose",
+						resourceId: compose.composeId,
+						resourceName: compose.name,
+						metadata,
+					});
+				} catch (error) {
+					console.error("cleanQueues audit failed:", error);
+				}
+			};
+			if (input.mode === "keepOldest") {
+				const result = await keepOldestQueuesByCompose(input.composeId);
+				if (result.removed.length > 0) {
+					await auditRemoved("keep_oldest_queue", {
+						queue: "keepOldest",
+						removedJobIds: result.removed.map((job) => job.jobId),
+					});
+				}
+				return result;
+			}
+			const removed = await cleanQueuesByCompose(input.composeId);
+			if (removed > 0) {
+				await auditRemoved("clean_queue", { queue: "all", removed });
+			}
 			return { success: true, message: "Queues cleaned successfully" };
 		}),
 	clearDeployments: protectedProcedure
@@ -350,6 +464,13 @@ export const composeRouter = createTRPCRouter({
 			});
 			const compose = await findComposeById(input.composeId);
 			await clearOldDeployments(compose.composeId, "compose");
+			await auditCancel(ctx, {
+				action: "clear_deployments",
+				targetType: "compose",
+				targetId: compose.composeId,
+				targetName: compose.appName,
+				composeId: compose.composeId,
+			});
 			await audit(ctx, {
 				action: "update",
 				resourceType: "compose",
@@ -365,7 +486,54 @@ export const composeRouter = createTRPCRouter({
 				deployment: ["cancel"],
 			});
 			const compose = await findComposeById(input.composeId);
-			await killDockerBuild("compose", compose.serverId);
+			const auditKill = async (deploymentIds: readonly string[]) => {
+				// One entry per deployment it stopped, so each cancelled deployment
+				// can show who stopped it; the one service-level entry when none was.
+				for (const deploymentId of deploymentIds.length
+					? deploymentIds
+					: [undefined]) {
+					await auditCancel(ctx, {
+						action: "kill_build",
+						targetType: "compose",
+						targetId: compose.composeId,
+						targetName: compose.appName,
+						composeId: compose.composeId,
+						deploymentId,
+					});
+				}
+				await audit(ctx, {
+					action: "cancel",
+					resourceType: "compose",
+					resourceId: compose.composeId,
+					resourceName: compose.name,
+				});
+			};
+			// A compose that builds on a build server is cancelled there, by
+			// deployment (see deployment-cancel.ts). The `pkill "docker compose"`
+			// below only ever runs on the serving host, where it would hit every
+			// other compose operation running there.
+			if (compose.buildServerId) {
+				const remote = await cancelBuildServerDeploymentsForService({
+					type: "compose",
+					composeId: input.composeId,
+				});
+				await auditKill(remote.deploymentIds);
+				return;
+			}
+			// A rolling replace that is running on the serving host has a cancel
+			// launcher of its own: it is signalled by its pid file, so the shield
+			// around its `up` steps holds. The `pkill` below matches by command
+			// line and would interrupt a recreate half way. It stays the fallback
+			// when nothing was stopped (the release step left no pid file, the
+			// launcher is missing, the host did not answer).
+			const rolling = await cancelBuildServerDeploymentsForService({
+				type: "compose",
+				composeId: input.composeId,
+			});
+			if (rolling.stopped === 0) {
+				await killDockerBuild("compose", compose.serverId);
+			}
+			await auditKill(rolling.deploymentIds);
 		}),
 
 	loadServices: protectedProcedure
@@ -375,6 +543,16 @@ export const composeRouter = createTRPCRouter({
 				service: ["read"],
 			});
 			return await loadServices(input.composeId, input.type);
+		}),
+	rollingEligibility: protectedProcedure
+		.input(apiFetchServices)
+		.query(async ({ input, ctx }) => {
+			await checkServicePermissionAndAccess(ctx, input.composeId, {
+				service: ["read"],
+			});
+			return await getComposeRollingReport(input.composeId, {
+				type: input.type,
+			});
 		}),
 	loadMountsByService: protectedProcedure
 		.input(
@@ -474,6 +652,7 @@ export const composeRouter = createTRPCRouter({
 			await checkServicePermissionAndAccess(ctx, input.composeId, {
 				deployment: ["create"],
 			});
+			if (input.priority) await assertCanPrioritize(ctx);
 			const compose = await findComposeById(input.composeId);
 
 			const jobData: DeploymentJob = {
@@ -497,11 +676,30 @@ export const composeRouter = createTRPCRouter({
 					resourceId: input.composeId,
 					resourceName: compose.name,
 				});
-				return true;
+				if (!input.priority) return true;
+				// Cloud runs the deploy straight away: there is no queue to go ahead
+				// in, and the caller is told so rather than left to assume.
+				return {
+					success: true,
+					message: "Deployment started",
+					composeId: compose.composeId,
+					priority: await recordPriorityUse(ctx, {
+						resourceType: "compose",
+						resourceId: input.composeId,
+						resourceName: compose.name,
+						via: "deploy",
+						outcome: undefined,
+					}),
+				};
 			}
-			await myQueue.add(
+			const queued = await myQueue.add(
 				"deployments",
-				{ ...jobData },
+				{
+					...jobData,
+					...(input.priority
+						? { priority: true, priorityBy: ctx.user.id }
+						: {}),
+				},
 				{
 					removeOnComplete: true,
 					removeOnFail: true,
@@ -513,10 +711,21 @@ export const composeRouter = createTRPCRouter({
 				resourceId: input.composeId,
 				resourceName: compose.name,
 			});
+			const priority = input.priority
+				? await recordPriorityUse(ctx, {
+						resourceType: "compose",
+						resourceId: input.composeId,
+						resourceName: compose.name,
+						via: "deploy",
+						jobId: queued.id,
+						outcome: queued.priority,
+					})
+				: undefined;
 			return {
 				success: true,
 				message: "Deployment queued",
 				composeId: compose.composeId,
+				...(priority ? { priority } : {}),
 			};
 		}),
 	redeploy: protectedProcedure
@@ -525,6 +734,7 @@ export const composeRouter = createTRPCRouter({
 			await checkServicePermissionAndAccess(ctx, input.composeId, {
 				deployment: ["create"],
 			});
+			if (input.priority) await assertCanPrioritize(ctx);
 			const compose = await findComposeById(input.composeId);
 			const jobData: DeploymentJob = {
 				composeId: input.composeId,
@@ -546,11 +756,30 @@ export const composeRouter = createTRPCRouter({
 					resourceId: input.composeId,
 					resourceName: compose.name,
 				});
-				return true;
+				if (!input.priority) return true;
+				// Cloud runs the deploy straight away: there is no queue to go ahead
+				// in, and the caller is told so rather than left to assume.
+				return {
+					success: true,
+					message: "Redeployment started",
+					composeId: compose.composeId,
+					priority: await recordPriorityUse(ctx, {
+						resourceType: "compose",
+						resourceId: input.composeId,
+						resourceName: compose.name,
+						via: "redeploy",
+						outcome: undefined,
+					}),
+				};
 			}
-			await myQueue.add(
+			const queued = await myQueue.add(
 				"deployments",
-				{ ...jobData },
+				{
+					...jobData,
+					...(input.priority
+						? { priority: true, priorityBy: ctx.user.id }
+						: {}),
+				},
 				{
 					removeOnComplete: true,
 					removeOnFail: true,
@@ -562,10 +791,21 @@ export const composeRouter = createTRPCRouter({
 				resourceId: input.composeId,
 				resourceName: compose.name,
 			});
+			const priority = input.priority
+				? await recordPriorityUse(ctx, {
+						resourceType: "compose",
+						resourceId: input.composeId,
+						resourceName: compose.name,
+						via: "redeploy",
+						jobId: queued.id,
+						outcome: queued.priority,
+					})
+				: undefined;
 			return {
 				success: true,
 				message: "Redeployment queued",
 				composeId: compose.composeId,
+				...(priority ? { priority } : {}),
 			};
 		}),
 	stop: protectedProcedure
@@ -612,6 +852,9 @@ export const composeRouter = createTRPCRouter({
 			const command = createCommand(
 				compose,
 				compose.mounts.length > 0 ? projectPath : undefined,
+				compose.buildServerId
+					? { overridePath: getComposeBuildOverridePath(compose) }
+					: undefined,
 			);
 			return `docker ${command}`;
 		}),
@@ -1278,8 +1521,15 @@ export const composeRouter = createTRPCRouter({
 						applicationType: "compose",
 					});
 
+					await auditCancel(ctx, {
+						action: "cancel_deployment",
+						targetType: "compose",
+						targetId: compose.composeId,
+						targetName: compose.appName,
+						composeId: compose.composeId,
+					});
 					await audit(ctx, {
-						action: "stop",
+						action: "cancel",
 						resourceType: "compose",
 						resourceId: input.composeId,
 						resourceName: compose.name,

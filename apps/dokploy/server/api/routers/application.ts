@@ -2,6 +2,7 @@ import {
 	assertNetworkIdsAttachableToResource,
 	// build-policy hook: required-checks support check at the API boundary.
 	assertRequiredChecksSupportedForUpdate,
+	cancelBuildServerDeploymentsForService,
 	clearOldDeployments,
 	createApplication,
 	createDomain,
@@ -30,6 +31,7 @@ import {
 	removePreviewDeployment,
 	removeService,
 	removeTraefikConfig,
+	removeUptimelyServiceRows,
 	scanServiceForTransfer,
 	startService,
 	startServiceRemote,
@@ -62,6 +64,12 @@ import {
 	withPermission,
 } from "@/server/api/trpc";
 import { audit } from "@/server/api/utils/audit";
+import { auditCancel } from "@/server/api/utils/cancel-audit";
+import {
+	assertCanPrioritize,
+	recordPriorityUse,
+} from "@/server/api/utils/deploy-priority";
+import { getRailpackVersions } from "@/server/api/utils/railpack-versions";
 import {
 	apiCreateApplication,
 	apiDeployApplication,
@@ -87,6 +95,7 @@ import {
 import type { DeploymentJob } from "@/server/queues/queue-types";
 import {
 	cleanQueuesByApplication,
+	keepOldestQueuesByApplication,
 	killDockerBuild,
 	myQueue,
 } from "@/server/queues/queueSetup";
@@ -125,11 +134,6 @@ function resolveDockerProviderFields(
 		registryUrl: input.registryUrl,
 	};
 }
-
-const RAILPACK_VERSIONS_CACHE_TTL = 1000 * 60 * 60 * 24;
-let railpackVersionsCache:
-	| { versions: string[]; fetchedAt: number }
-	| undefined;
 
 export const applicationRouter = createTRPCRouter({
 	create: protectedProcedure
@@ -423,6 +427,10 @@ export const applicationRouter = createTRPCRouter({
 				.where(eq(applications.applicationId, input.applicationId))
 				.returning();
 
+			await removeUptimelyServiceRows([
+				{ serviceType: "application", serviceId: input.applicationId },
+			]);
+
 			if (!IS_CLOUD) {
 				await cleanQueuesByApplication(input.applicationId);
 			}
@@ -508,6 +516,7 @@ export const applicationRouter = createTRPCRouter({
 			await checkServicePermissionAndAccess(ctx, input.applicationId, {
 				deployment: ["create"],
 			});
+			if (input.priority) await assertCanPrioritize(ctx);
 			const application = await findApplicationById(input.applicationId);
 			const jobData: DeploymentJob = {
 				applicationId: input.applicationId,
@@ -529,11 +538,30 @@ export const applicationRouter = createTRPCRouter({
 					resourceId: application.applicationId,
 					resourceName: application.appName,
 				});
-				return true;
+				if (!input.priority) return true;
+				// Cloud runs the deploy straight away: there is no queue to go ahead
+				// in, and the caller is told so rather than left to assume.
+				return {
+					success: true,
+					message: "Redeployment started",
+					applicationId: application.applicationId,
+					priority: await recordPriorityUse(ctx, {
+						resourceType: "application",
+						resourceId: application.applicationId,
+						resourceName: application.appName,
+						via: "redeploy",
+						outcome: undefined,
+					}),
+				};
 			}
-			await myQueue.add(
+			const queued = await myQueue.add(
 				"deployments",
-				{ ...jobData },
+				{
+					...jobData,
+					...(input.priority
+						? { priority: true, priorityBy: ctx.user.id }
+						: {}),
+				},
 				{
 					removeOnComplete: true,
 					removeOnFail: true,
@@ -545,6 +573,21 @@ export const applicationRouter = createTRPCRouter({
 				resourceId: application.applicationId,
 				resourceName: application.appName,
 			});
+			if (!input.priority) return;
+			const priority = await recordPriorityUse(ctx, {
+				resourceType: "application",
+				resourceId: application.applicationId,
+				resourceName: application.appName,
+				via: "redeploy",
+				jobId: queued.id,
+				outcome: queued.priority,
+			});
+			return {
+				success: true,
+				message: "Redeployment queued",
+				applicationId: application.applicationId,
+				priority,
+			};
 		}),
 	saveEnvironment: protectedProcedure
 		.input(apiSaveEnvironmentVariables)
@@ -954,6 +997,7 @@ export const applicationRouter = createTRPCRouter({
 			await checkServicePermissionAndAccess(ctx, input.applicationId, {
 				deployment: ["create"],
 			});
+			if (input.priority) await assertCanPrioritize(ctx);
 			const application = await findApplicationById(input.applicationId);
 			// Allow overriding the Docker image/tag at deploy time for
 			// Docker-source applications. This mirrors the manual "save Docker
@@ -983,11 +1027,30 @@ export const applicationRouter = createTRPCRouter({
 					resourceId: application.applicationId,
 					resourceName: application.appName,
 				});
-				return true;
+				if (!input.priority) return true;
+				// Cloud runs the deploy straight away: there is no queue to go ahead
+				// in, and the caller is told so rather than left to assume.
+				return {
+					success: true,
+					message: "Deployment started",
+					applicationId: application.applicationId,
+					priority: await recordPriorityUse(ctx, {
+						resourceType: "application",
+						resourceId: application.applicationId,
+						resourceName: application.appName,
+						via: "deploy",
+						outcome: undefined,
+					}),
+				};
 			}
-			await myQueue.add(
+			const queued = await myQueue.add(
 				"deployments",
-				{ ...jobData },
+				{
+					...jobData,
+					...(input.priority
+						? { priority: true, priorityBy: ctx.user.id }
+						: {}),
+				},
 				{
 					removeOnComplete: true,
 					removeOnFail: true,
@@ -999,15 +1062,79 @@ export const applicationRouter = createTRPCRouter({
 				resourceId: application.applicationId,
 				resourceName: application.appName,
 			});
+			if (!input.priority) return;
+			const priority = await recordPriorityUse(ctx, {
+				resourceType: "application",
+				resourceId: application.applicationId,
+				resourceName: application.appName,
+				via: "deploy",
+				jobId: queued.id,
+				outcome: queued.priority,
+			});
+			return {
+				success: true,
+				message: "Deployment queued",
+				applicationId: application.applicationId,
+				priority,
+			};
 		}),
 
 	cleanQueues: protectedProcedure
-		.input(apiFindOneApplication)
+		.input(
+			apiFindOneApplication.extend({
+				mode: z
+					.enum(["all", "keepOldest"])
+					.default("all")
+					.describe(
+						'"all" (default) removes every waiting job of the application, PR previews included. "keepOldest" keeps the earliest waiting job of each group of duplicates and removes the later ones; only plain deploy and redeploy jobs of the application are considered (never PR previews), deploy and redeploy are separate, and jobs that differ in freshVolumes, pinnedImage or priority are not duplicates. Active jobs are never touched. keepOldest returns { kept, removed }, each a list of { jobId, enqueuedAt, type }.',
+					),
+			}),
+		)
 		.mutation(async ({ input, ctx }) => {
 			await checkServicePermissionAndAccess(ctx, input.applicationId, {
 				deployment: ["cancel"],
 			});
-			await cleanQueuesByApplication(input.applicationId);
+			const application = await findApplicationById(input.applicationId);
+			// The jobs are already gone once the queue helper returns, so a failing
+			// audit must not turn the answer into an error and hide what was removed.
+			const auditRemoved = async (
+				action: "clean_queue" | "keep_oldest_queue",
+				metadata: Record<string, unknown>,
+			) => {
+				await auditCancel(ctx, {
+					action,
+					targetType: "application",
+					targetId: application.applicationId,
+					targetName: application.appName,
+					applicationId: application.applicationId,
+					metadata,
+				});
+				try {
+					await audit(ctx, {
+						action: "cancel",
+						resourceType: "application",
+						resourceId: application.applicationId,
+						resourceName: application.appName,
+						metadata,
+					});
+				} catch (error) {
+					console.error("cleanQueues audit failed:", error);
+				}
+			};
+			if (input.mode === "keepOldest") {
+				const result = await keepOldestQueuesByApplication(input.applicationId);
+				if (result.removed.length > 0) {
+					await auditRemoved("keep_oldest_queue", {
+						queue: "keepOldest",
+						removedJobIds: result.removed.map((job) => job.jobId),
+					});
+				}
+				return result;
+			}
+			const removed = await cleanQueuesByApplication(input.applicationId);
+			if (removed > 0) {
+				await auditRemoved("clean_queue", { queue: "all", removed });
+			}
 		}),
 	clearDeployments: protectedProcedure
 		.input(apiFindOneApplication)
@@ -1017,6 +1144,13 @@ export const applicationRouter = createTRPCRouter({
 			});
 			const application = await findApplicationById(input.applicationId);
 			await clearOldDeployments(application.applicationId, "application");
+			await auditCancel(ctx, {
+				action: "clear_deployments",
+				targetType: "application",
+				targetId: application.applicationId,
+				targetName: application.appName,
+				applicationId: application.applicationId,
+			});
 			await audit(ctx, {
 				action: "delete",
 				resourceType: "application",
@@ -1032,9 +1166,32 @@ export const applicationRouter = createTRPCRouter({
 				deployment: ["cancel"],
 			});
 			const application = await findApplicationById(input.applicationId);
-			await killDockerBuild("application", application.serverId);
+			// A build on a build server is stopped there, by deployment (see
+			// deployment-cancel.ts). The `pkill` below only ever runs on the host
+			// that serves the application, where it would hit unrelated builds.
+			const remote = await cancelBuildServerDeploymentsForService({
+				type: "application",
+				applicationId: input.applicationId,
+			});
+			if (!remote.usesBuildServer && !application.buildServerId) {
+				await killDockerBuild("application", application.serverId);
+			}
+			// One entry per deployment it stopped, so each cancelled deployment can
+			// show who stopped it; the one service-level entry when none was.
+			for (const deploymentId of remote.deploymentIds.length
+				? remote.deploymentIds
+				: [undefined]) {
+				await auditCancel(ctx, {
+					action: "kill_build",
+					targetType: "application",
+					targetId: application.applicationId,
+					targetName: application.appName,
+					applicationId: application.applicationId,
+					deploymentId,
+				});
+			}
 			await audit(ctx, {
-				action: "stop",
+				action: "cancel",
 				resourceType: "application",
 				resourceId: application.applicationId,
 				resourceName: application.appName,
@@ -1212,8 +1369,15 @@ export const applicationRouter = createTRPCRouter({
 						applicationId: input.applicationId,
 						applicationType: "application",
 					});
+					await auditCancel(ctx, {
+						action: "cancel_deployment",
+						targetType: "application",
+						targetId: application.applicationId,
+						targetName: application.appName,
+						applicationId: application.applicationId,
+					});
 					await audit(ctx, {
-						action: "stop",
+						action: "cancel",
 						resourceType: "application",
 						resourceId: application.applicationId,
 						resourceName: application.appName,
@@ -1371,36 +1535,7 @@ export const applicationRouter = createTRPCRouter({
 			};
 		}),
 
-	getRailpackVersions: protectedProcedure.query(async () => {
-		if (
-			railpackVersionsCache &&
-			Date.now() - railpackVersionsCache.fetchedAt < RAILPACK_VERSIONS_CACHE_TTL
-		) {
-			return railpackVersionsCache.versions;
-		}
-
-		const res = await fetch(
-			"https://api.github.com/repos/railwayapp/railpack/releases",
-			{
-				headers: {
-					Accept: "application/vnd.github+json",
-					...(process.env.GITHUB_TOKEN
-						? { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` }
-						: {}),
-				},
-			},
-		);
-		if (!res.ok) {
-			throw new TRPCError({
-				code: "INTERNAL_SERVER_ERROR",
-				message: "Failed to fetch Railpack versions from GitHub",
-			});
-		}
-		const releases = (await res.json()) as Array<{ tag_name: string }>;
-		const versions = releases.map((r) => r.tag_name.replace(/^v/i, ""));
-		railpackVersionsCache = { versions, fetchedAt: Date.now() };
-		return versions;
-	}),
+	getRailpackVersions: protectedProcedure.query(() => getRailpackVersions()),
 
 	readLogs: protectedProcedure
 		.input(

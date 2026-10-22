@@ -1,13 +1,19 @@
-import { exec, execFile, spawn } from "node:child_process";
+import { type ChildProcess, exec, execFile, spawn } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 import util from "node:util";
 import { findServerById } from "@dokploy/server/services/server";
-import { Client } from "ssh2";
+import {
+	type RemoteBuildCancelTarget,
+	wrapCancelableRemoteBuild,
+} from "@dokploy/server/utils/builders/remote-build-cancel";
+import { Client, type ClientCallback } from "ssh2";
 import {
 	ExecError,
 	MAX_EXEC_OUTPUT_TAIL,
 	truncateOutputTail,
 } from "./ExecError";
+import { assertServerHasSshKey } from "./MissingSshKeyError";
+import { registerRemoteBuild } from "./remote-build-registry";
 
 export class WriteFileRemoteError extends Error {
 	constructor(
@@ -39,10 +45,21 @@ export const execAsync = async (
 		env?: NodeJS.ProcessEnv;
 		shell?: string;
 		maxBuffer?: number;
+		// Written to the command's stdin. Secrets go here, never in `command`:
+		// the command line is visible to every user on the host through ps.
+		stdin?: string;
 	},
 ): Promise<{ stdout: string; stderr: string }> => {
 	try {
-		const result = await execAsyncBase(command, options);
+		const { stdin, ...execOptions } = options ?? {};
+		const pending = execAsyncBase(command, execOptions);
+		if (stdin !== undefined) {
+			// A command that exits without reading its input must not crash the
+			// process with an unhandled EPIPE; its exit status is what we report.
+			pending.child.stdin?.on("error", () => {});
+			pending.child.stdin?.end(stdin);
+		}
+		const result = await pending;
 		return {
 			stdout: result.stdout.toString(),
 			stderr: result.stderr.toString(),
@@ -65,6 +82,70 @@ export const execAsync = async (
 			});
 		}
 		throw error;
+	}
+};
+
+/**
+ * `execAsync` for a command that must be stoppable from another request: it
+ * runs on this host in its own session with a pid file (see
+ * `builders/remote-build-cancel.ts`), and `abortRemoteBuild(cancelable.
+ * deploymentId)` drops the wait for it. The counterpart of `execAsyncRemote`'s
+ * `cancelable` option for a serving host that is the Dokploy host itself.
+ *
+ * Aborting kills the wrapper shell only; the command itself is stopped by the
+ * kill script, by pid file, which is what lets a trap in it run.
+ */
+export const execAsyncCancelable = async (
+	command: string,
+	cancelable: RemoteBuildCancelTarget,
+	options: {
+		/**
+		 * Runs after the command is registered and before it starts. If it
+		 * throws, the command is not started.
+		 */
+		beforeExec?: () => void | Promise<void>;
+	} = {},
+): Promise<{ stdout: string; stderr: string }> => {
+	let aborted: string | undefined;
+	let child: ChildProcess | undefined;
+	let rejectAborted: ((error: ExecError) => void) | undefined;
+	const unregister = registerRemoteBuild(cancelable.deploymentId, (reason) => {
+		aborted = reason;
+		child?.kill("SIGKILL");
+		rejectAborted?.(
+			new ExecError(`Local build was cancelled: ${reason}`, { command }),
+		);
+	});
+	try {
+		await options.beforeExec?.();
+		if (aborted !== undefined) {
+			throw new ExecError(`Local build was cancelled: ${aborted}`, { command });
+		}
+		return await new Promise<{ stdout: string; stderr: string }>(
+			(resolve, reject) => {
+				rejectAborted = reject;
+				child = exec(
+					wrapCancelableRemoteBuild(command, cancelable),
+					(error, stdout, stderr) => {
+						if (!error) {
+							resolve({ stdout: stdout.toString(), stderr: stderr.toString() });
+							return;
+						}
+						reject(
+							new ExecError(`Command execution failed: ${error.message}`, {
+								command,
+								stdout: stdout.toString(),
+								stderr: stderr.toString(),
+								exitCode: error.code,
+								originalError: error,
+							}),
+						);
+					},
+				);
+			},
+		);
+	} finally {
+		unregister();
 	}
 };
 
@@ -256,11 +337,40 @@ export const execAsyncRemote = async (
 	command: string,
 	onData?: (data: string) => void,
 	// The caller consumes the output through onData; keep only its tail.
-	options: { streamOnly?: boolean } = {},
+	options: {
+		streamOnly?: boolean;
+		/**
+		 * A build on a build server that Dokploy must be able to cancel: the
+		 * command runs in its own session with a pid file (see
+		 * `builders/remote-build-cancel.ts`), and `abortRemoteBuild(deploymentId)`
+		 * can drop this connection. Omitted for every other command, which then
+		 * runs exactly as before.
+		 */
+		cancelable?: RemoteBuildCancelTarget;
+		/**
+		 * Written to the command's stdin, then closed. Secrets go here, never in
+		 * `command`: the command line is visible to every user on the host.
+		 */
+		stdin?: string;
+		/**
+		 * Runs once the connection is up, right before the command is sent. If it
+		 * throws, the command is not sent, the connection is closed and the call
+		 * rejects with that error. For a last check that the command should
+		 * still run after a slow connect.
+		 */
+		beforeExec?: () => void | Promise<void>;
+		/**
+		 * Aborting drops the SSH connection and rejects the command, so a caller
+		 * that stops waiting (a probe that timed out) does not leave a connection
+		 * running until it ends by itself. Also while `beforeExec` is pending: the
+		 * command is then never sent.
+		 */
+		signal?: AbortSignal;
+	} = {},
 ): Promise<{ stdout: string; stderr: string }> => {
 	if (!serverId) return { stdout: "", stderr: "" };
 	const server = await findServerById(serverId);
-	if (!server.sshKeyId) throw new Error("No SSH key available for this server");
+	assertServerHasSshKey(server);
 
 	const stdoutOutput = new OutputCollector(options.streamOnly);
 	const stderrOutput = new OutputCollector(options.streamOnly);
@@ -272,13 +382,79 @@ export const execAsyncRemote = async (
 		output.add(text);
 		onData?.(text);
 	};
-	return new Promise((resolve, reject) => {
+	const { cancelable } = options;
+	const remoteCommand = cancelable
+		? wrapCancelableRemoteBuild(command, cancelable)
+		: command;
+	const { signal } = options;
+	let detachAbort = () => {};
+	return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
 		const conn = new Client();
+		if (signal) {
+			const onAbort = () => {
+				conn.destroy();
+				reject(
+					new ExecError("Remote command was aborted", { command, serverId }),
+				);
+			};
+			if (signal.aborted) {
+				reject(
+					new ExecError("Remote command was aborted", { command, serverId }),
+				);
+				return;
+			}
+			signal.addEventListener("abort", onAbort, { once: true });
+			detachAbort = () => signal.removeEventListener("abort", onAbort);
+		}
+		if (cancelable) {
+			// Dropping the connection rejects this command so the deployment job
+			// ends; the build on the server is stopped separately, by pid file.
+			const unregister = registerRemoteBuild(
+				cancelable.deploymentId,
+				(reason) => {
+					conn.destroy();
+					reject(
+						new ExecError(`Remote build was cancelled: ${reason}`, {
+							command,
+							serverId,
+						}),
+					);
+				},
+			);
+			conn.once("close", unregister);
+		}
+
+		// The connection can drop while `beforeExec` is pending, which makes
+		// `conn.exec` throw "Not connected": reject the call instead of leaving an
+		// unhandled rejection behind.
+		const execOrReject = (cmd: string, callback: ClientCallback) => {
+			try {
+				conn.exec(cmd, callback);
+			} catch (error) {
+				conn.end();
+				reject(error);
+			}
+		};
 
 		sleep(1000);
 		conn
-			.once("ready", () => {
-				conn.exec(command, (err, stream) => {
+			.once("ready", async () => {
+				if (signal?.aborted) {
+					conn.destroy();
+					return;
+				}
+				if (options.beforeExec) {
+					try {
+						await options.beforeExec();
+					} catch (error) {
+						conn.end();
+						reject(error);
+						return;
+					}
+					// Aborted while the check was pending: already destroyed and rejected.
+					if (signal?.aborted) return;
+				}
+				execOrReject(remoteCommand, (err, stream) => {
 					if (err) {
 						onData?.(err.message);
 						reject(
@@ -289,6 +465,11 @@ export const execAsyncRemote = async (
 							}),
 						);
 						return;
+					}
+					if (options.stdin !== undefined) {
+						// Nothing to send for an empty secret, but the input is still closed.
+						if (options.stdin) stream.write(options.stdin);
+						stream.end();
 					}
 					stream
 						.on("close", (code: number, _signal: string) => {
@@ -378,7 +559,7 @@ export const execAsyncRemote = async (
 				privateKey: server.sshKey?.privateKey,
 				timeout: 99999,
 			});
-	});
+	}).finally(() => detachAbort());
 };
 
 /** A command on a remote server that reads its input from a caller. */
@@ -405,9 +586,16 @@ export interface RemoteInputSession {
 export const openRemoteInputSession = async (
 	serverId: string,
 	command: string,
+	options: {
+		/**
+		 * Receives the command's stdout as it arrives (stderr is not passed on).
+		 * For commands whose output the caller needs, not just their exit status.
+		 */
+		onStdout?: (text: string) => void;
+	} = {},
 ): Promise<RemoteInputSession> => {
 	const server = await findServerById(serverId);
-	if (!server.sshKeyId) throw new Error("No SSH key available for this server");
+	assertServerHasSshKey(server);
 
 	return new Promise((resolve, reject) => {
 		const conn = new Client();
@@ -449,7 +637,10 @@ export const openRemoteInputSession = async (
 					opened = true;
 					stream.setEncoding("utf8");
 					stream.stderr.setEncoding("utf8");
-					stream.on("data", (data: string) => output.add(data));
+					stream.on("data", (data: string) => {
+						output.add(data);
+						options.onStdout?.(data);
+					});
 					stream.stderr.on("data", (data: string) => output.add(data));
 					stream.on("close", (code: number | undefined) => {
 						if (code === 0) {
@@ -555,7 +746,7 @@ export const writeFileRemote = async (
 	content: string,
 ): Promise<void> => {
 	const server = await findServerById(serverId);
-	if (!server.sshKeyId) throw new Error("No SSH key available for this server");
+	assertServerHasSshKey(server);
 
 	return new Promise((resolve, reject) => {
 		const conn = new Client();

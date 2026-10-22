@@ -1,9 +1,12 @@
 import { db } from "@dokploy/server/db";
 import {
 	type apiCreateRegistry,
-	getSafeRegistryLoginCommand,
+	type RegistryLoginData,
 	registry,
+	server,
 } from "@dokploy/server/db/schema";
+import { getRegistryConfigDir } from "@dokploy/server/utils/process/dockerConfig";
+import { runDockerLogin } from "@dokploy/server/utils/process/dockerLogin";
 import {
 	execAsync,
 	execAsyncRemote,
@@ -19,17 +22,6 @@ export type Registry = typeof registry.$inferSelect;
 function shEscape(s: string | undefined): string {
 	if (!s) return "''";
 	return `'${s.replace(/'/g, `'\\''`)}'`;
-}
-
-export function safeDockerLoginCommand(
-	registry: string | undefined,
-	user: string | undefined,
-	pass: string | undefined,
-) {
-	const escapedRegistry = shEscape(registry);
-	const escapedUser = shEscape(user);
-	const escapedPassword = shEscape(pass);
-	return `printf %s ${escapedPassword} | docker login ${escapedRegistry} -u ${escapedUser} --password-stdin`;
 }
 
 function sanitizeRegistryError(
@@ -80,21 +72,21 @@ export const createRegistry = async (
 			});
 			ecrAuthPassword = token.password;
 		}
-		const loginCommand = getSafeRegistryLoginCommand({
+		const login: RegistryLoginData = {
 			registryType: newRegistry.registryType,
 			registryUrl: input.registryUrl,
 			username: input.username,
 			password: input.password,
 			ecrAuthPassword,
-		});
+		};
 		try {
 			if (input.serverId && input.serverId !== "none") {
-				await execAsyncRemote(input.serverId, loginCommand);
+				await runDockerLogin(login, input.serverId);
 			} else if (
 				newRegistry.registryType === "cloud" ||
 				newRegistry.registryType === "awsEcr"
 			) {
-				await execAsync(loginCommand);
+				await runDockerLogin(login);
 			}
 		} catch (error) {
 			const sanitized = sanitizeRegistryError(error, input.password);
@@ -105,26 +97,101 @@ export const createRegistry = async (
 	});
 };
 
-export const removeRegistry = async (registryId: string) => {
+/**
+ * The command that deletes one registry's own docker config dir, or null when
+ * the computed path is not exactly `<base>/docker-config/<registryId>`: an odd
+ * id must never turn into an `rm -rf` of the parent directory.
+ */
+export const getRegistryConfigDirRemovalCommand = (
+	registryId: string,
+	isRemote: boolean,
+): string | null => {
+	let dir: string;
 	try {
-		const response = await db
+		dir = getRegistryConfigDir(registryId, isRemote);
+	} catch {
+		return null;
+	}
+	if (
+		!registryId ||
+		!dir.startsWith("/") ||
+		!dir.endsWith(`/docker-config/${registryId}`)
+	) {
+		return null;
+	}
+	return `rm -rf -- ${shEscape(dir)}`;
+};
+
+const errorText = (error: unknown) =>
+	error instanceof Error ? error.message : String(error);
+
+/**
+ * Deletes the per-registry docker config dir (it holds that registry's login)
+ * from this host and from every server of the organization. Best effort: a
+ * host that cannot be reached is logged and skipped.
+ */
+const removeRegistryConfigDirs = async (
+	registryId: string,
+	organizationId: string,
+) => {
+	const local = getRegistryConfigDirRemovalCommand(registryId, false);
+	const remote = getRegistryConfigDirRemovalCommand(registryId, true);
+	if (!local || !remote) {
+		console.error(`Skipping docker config cleanup for registry ${registryId}`);
+		return;
+	}
+
+	const tasks: Promise<unknown>[] = [];
+	if (!IS_CLOUD) {
+		tasks.push(
+			execAsync(local).catch((error) => {
+				console.error(
+					`Failed to remove the docker config dir of registry ${registryId}:`,
+					errorText(error),
+				);
+			}),
+		);
+	}
+	try {
+		const servers = await db.query.server.findMany({
+			where: eq(server.organizationId, organizationId),
+			columns: { serverId: true },
+		});
+		for (const { serverId } of servers) {
+			tasks.push(
+				execAsyncRemote(serverId, remote).catch((error) => {
+					console.error(
+						`Failed to remove the docker config dir of registry ${registryId} on server ${serverId}:`,
+						errorText(error),
+					);
+				}),
+			);
+		}
+	} catch (error) {
+		console.error(
+			`Failed to list servers for the docker config cleanup of registry ${registryId}:`,
+			errorText(error),
+		);
+	}
+	await Promise.all(tasks);
+};
+
+export const removeRegistry = async (registryId: string) => {
+	let response: Registry;
+	try {
+		const deleted = await db
 			.delete(registry)
 			.where(eq(registry.registryId, registryId))
 			.returning()
 			.then((res) => res[0]);
 
-		if (!response) {
+		if (!deleted) {
 			throw new TRPCError({
 				code: "NOT_FOUND",
 				message: "Registry not found",
 			});
 		}
-
-		if (!IS_CLOUD) {
-			await execAsync(`docker logout ${shEscape(response.registryUrl)}`);
-		}
-
-		return response;
+		response = deleted;
 	} catch (error) {
 		throw new TRPCError({
 			code: "BAD_REQUEST",
@@ -132,6 +199,22 @@ export const removeRegistry = async (registryId: string) => {
 			cause: error,
 		});
 	}
+
+	// The row is gone: nothing below may turn that into a failure.
+	if (!IS_CLOUD) {
+		try {
+			// The default config still feeds swarm --with-registry-auth.
+			await execAsync(`docker logout ${shEscape(response.registryUrl)}`);
+		} catch (error) {
+			console.error(
+				`Failed to log out of ${response.registryUrl}:`,
+				errorText(error),
+			);
+		}
+	}
+	await removeRegistryConfigDirs(response.registryId, response.organizationId);
+
+	return response;
 };
 
 export const updateRegistry = async (
@@ -157,13 +240,13 @@ export const updateRegistry = async (
 			});
 			ecrAuthPassword = token.password;
 		}
-		const loginCommand = getSafeRegistryLoginCommand({
+		const login: RegistryLoginData = {
 			registryType: response?.registryType || "cloud",
 			registryUrl: response?.registryUrl || undefined,
 			username: response?.username || undefined,
 			password: response?.password || undefined,
 			ecrAuthPassword,
-		});
+		};
 
 		if (
 			IS_CLOUD &&
@@ -178,12 +261,12 @@ export const updateRegistry = async (
 
 		try {
 			if (registryData?.serverId && registryData?.serverId !== "none") {
-				await execAsyncRemote(registryData.serverId, loginCommand);
+				await runDockerLogin(login, registryData.serverId);
 			} else if (
 				response?.registryType === "cloud" ||
 				response?.registryType === "awsEcr"
 			) {
-				await execAsync(loginCommand);
+				await runDockerLogin(login);
 			}
 		} catch (execError) {
 			throw new Error(sanitizeRegistryError(execError, response?.password));

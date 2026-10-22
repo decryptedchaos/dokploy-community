@@ -1,5 +1,7 @@
+import { deployPriorityInput } from "@dokploy/server/db/validations/deploy-priority";
 import { VALID_BRANCH_REGEX } from "@dokploy/server/utils/git-branch-validation";
 import { VALID_GIT_URL_REGEX } from "@dokploy/server/utils/git-url-validation";
+import { getPreviewImageTemplateError } from "@dokploy/server/utils/preview-image";
 import {
 	isValidPreviewWildcard,
 	PREVIEW_WILDCARD_GUIDANCE,
@@ -106,6 +108,12 @@ export const applications = pgTable("application", {
 	previewBuildSecrets: encryptedText("previewBuildSecrets"),
 	previewLabels: text("previewLabels").array(),
 	previewWildcard: text("previewWildcard"),
+	/**
+	 * Fork column. Image template for previews of a Docker-image application
+	 * (no repository to clone), e.g. `ghcr.io/acme/app:pr-${{preview.prNumber}}`.
+	 * `null` means previews are not available for the application.
+	 */
+	previewDockerImage: text("previewDockerImage"),
 	previewPort: integer("previewPort").default(3000),
 	previewHttps: boolean("previewHttps").notNull().default(false),
 	previewPath: text("previewPath").default("/"),
@@ -392,6 +400,16 @@ const createSchema = createInsertSchema(applications, {
 		.string()
 		.refine(isValidPreviewWildcard, { message: PREVIEW_WILDCARD_GUIDANCE })
 		.optional(),
+	previewDockerImage: z
+		.string()
+		.superRefine((value, ctx) => {
+			const message = getPreviewImageTemplateError(value);
+			if (message) {
+				ctx.addIssue({ code: "custom", message });
+			}
+		})
+		.nullable()
+		.optional(),
 	previewLimit: z.number().optional(),
 	previewHttps: z.boolean().optional(),
 	previewPath: z.string().optional(),
@@ -440,6 +458,7 @@ export const apiDeployApplication = createSchema
 		// Docker-source applications (e.g. deploy a freshly built tag from CI
 		// without a separate "save Docker provider" call).
 		dockerImage: z.string().optional(),
+		priority: deployPriorityInput,
 	});
 
 export const apiRedeployApplication = createSchema
@@ -450,6 +469,7 @@ export const apiRedeployApplication = createSchema
 		applicationId: z.string().min(1),
 		title: z.string().optional(),
 		description: z.string().optional(),
+		priority: deployPriorityInput,
 	});
 
 export const apiReloadApplication = createSchema
@@ -606,7 +626,10 @@ export const apiUpdateApplication = createSchema
 	.extend({
 		applicationId: z.string().min(1),
 	})
-	.omit({ serverId: true });
+	// `snapvisorProjectName` only goes through
+	// `snapvisor.setApplicationProject`, which validates the slug and checks
+	// the organization.
+	.omit({ serverId: true, snapvisorProjectName: true });
 
 // Schema for transferring application to another server
 export const apiTransferApplication = z.object({

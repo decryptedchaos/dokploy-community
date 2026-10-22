@@ -6,12 +6,16 @@ import {
 	IS_CLOUD,
 	initCancelDeployments,
 	initCronJobs,
+	initDeploymentCancelAuditPruneCronJob,
+	initDoDomainSyncCronJobs,
 	initEnterpriseBackupCronJobs,
 	initializeNetwork,
 	initMcpTokenPurgeCronJob,
 	initSchedules,
+	initSnapvisorBuildChecks,
 	initVolumeBackupsCronJobs,
 	isMcpDisabled,
+	isNotSwarmManagerError,
 	sendDokployRestartNotifications,
 	setBackgroundErrorReporter,
 	setupDirectories,
@@ -120,25 +124,42 @@ void app
 				} catch (e) {
 					// Do not skip the cron/schedule setup below because the overlay
 					// network could not be created.
-					console.error("Failed to initialize dokploy-network", e);
-					captureError(e, { handler: "initializeNetwork" });
+					if (isNotSwarmManagerError(e)) {
+						// Operator setup problem, not a bug: say how to fix it and keep
+						// it out of error reporting.
+						console.warn(
+							"Skipped creating dokploy-network: this Docker node is not a swarm manager. Run `docker swarm init` on this host (or point Dokploy at the manager node).",
+						);
+					} else {
+						console.error("Failed to initialize dokploy-network", e);
+						captureError(e, { handler: "initializeNetwork" });
+					}
 				}
 				await initCronJobs();
 				await initSchedules();
 				await initCancelDeployments();
 				await initVolumeBackupsCronJobs();
+				// Outbound DoDomain status polling; webhooks are only a fast path.
+				initDoDomainSyncCronJobs();
 				await sendDokployRestartNotifications();
 			}
 			await initEnterpriseBackupCronJobs();
+			initDeploymentCancelAuditPruneCronJob();
 
 			if (!isMcpDisabled()) {
 				initMcpTokenPurgeCronJob();
 			}
 
+			initSnapvisorBuildChecks();
+
 			if (!IS_CLOUD) {
 				console.log("Starting Deployment Worker");
-				const { startDeploymentWorker } = await import("./queues/queueSetup");
+				const { startDeploymentWorker, restoreQueuedDeployments } =
+					await import("./queues/queueSetup");
 				await startDeploymentWorker();
+				// Jobs the previous process left waiting or running. Never throws:
+				// failures are logged and reported inside, startup carries on.
+				await restoreQueuedDeployments();
 			}
 		} catch (e) {
 			console.error("Main Server Error", e);

@@ -8,14 +8,14 @@ title: "Dokploy Community Edition"
 # jekyll-seo-tag builds the home page <title> as "title | tagline"; without a
 # tagline it falls back to the long description below.
 tagline: "A self-hosted Dokploy fork"
-description: "A self-hosted Dokploy fork: upstream Dokploy plus 100+ community fixes, native Uptimely, Snapvisor and DoDomain integrations, an MCP server and more."
+description: "A self-hosted Dokploy fork: upstream Dokploy plus an MCP server, Compose previews, Cloudflare Tunnels and Uptimely, Snapvisor and DoDomain integrations."
 url: "https://dokploy-community.devino.ca"
 baseurl: ""
 lang: en
 
 # Release the site describes. Shown as softwareVersion in the home page JSON-LD and
 # kept equal to apps/dokploy/package.json by a test.
-version: v0.30.8-community.7
+version: v0.30.8-community.30
 
 # Social preview. jekyll-seo-tag only reads `image` from the page, so it is set
 # for every page through front matter defaults (it then emits og:image and
@@ -39,7 +39,6 @@ exclude:
   - apps
   - packages
   - docs
-  - patches
   - scripts
   - .github
   - .claude
@@ -60,6 +59,8 @@ exclude:
   - node_modules
   - vendor
   # Repository-meta Markdown that is not a public site page (still on GitHub)
+  - AGENTS.md
+  - CHANGELOG.md
   - CONTRIBUTING.md
   - GUIDES.md
   - SECURITY.md

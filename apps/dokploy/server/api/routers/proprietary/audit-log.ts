@@ -29,6 +29,7 @@ export const auditLogRouter = createTRPCRouter({
 						"deploy",
 						"cancel",
 						"redeploy",
+						"prioritize",
 						"login",
 						"logout",
 					])
@@ -39,6 +40,8 @@ export const auditLogRouter = createTRPCRouter({
 						"service",
 						"environment",
 						"deployment",
+						"application",
+						"compose",
 						"user",
 						"customRole",
 						"domain",

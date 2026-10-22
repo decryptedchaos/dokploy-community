@@ -1,10 +1,11 @@
 import fs, { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { paths } from "@dokploy/server/constants";
 import { db } from "@dokploy/server/db";
 import { network, patch } from "@dokploy/server/db/schema";
 import type { Compose } from "@dokploy/server/services/compose";
 import type { Domain } from "@dokploy/server/services/domain";
+import { TRPCError } from "@trpc/server";
 import { eq, inArray } from "drizzle-orm";
 import { quote } from "shell-quote";
 import { parse, stringify } from "yaml";
@@ -18,12 +19,19 @@ import { cloneGitlabRepository } from "../providers/gitlab";
 import { getCreateComposeFileCommand } from "../providers/raw";
 import { randomizeDeployableSpecificationFile } from "./collision";
 import { randomizeSpecificationFile } from "./compose";
+import {
+	getInstallStagedFileCommand,
+	STAGED_COMPOSE_PREFIX,
+	STAGED_COMPOSE_SUFFIX,
+	type StageOptions,
+	sanitizeStageId,
+	stageFiles,
+} from "./staging";
 import type {
 	ComposeSpecification,
 	DefinitionsService,
 	PropertiesNetworks,
 } from "./types";
-import { encodeBase64 } from "./utils";
 
 export const cloneCompose = async (compose: Compose) => {
 	let command = "set -e;";
@@ -42,7 +50,7 @@ export const cloneCompose = async (compose: Compose) => {
 	} else if (compose.sourceType === "gitea") {
 		command += await cloneGiteaRepository(entity);
 	} else if (compose.sourceType === "raw") {
-		command += getCreateComposeFileCommand(compose);
+		command += await getCreateComposeFileCommand(compose);
 	}
 	return command;
 };
@@ -70,6 +78,7 @@ export const loadDockerCompose = async (
 		const yamlStr = readFileSync(path, "utf8");
 		const parsedConfig = parse(yamlStr, {
 			maxAliasCount: 10000,
+			merge: true,
 		}) as ComposeSpecification;
 		return parsedConfig;
 	}
@@ -95,6 +104,7 @@ export const loadDockerComposeRemote = async (
 		if (!stdout) return null;
 		const parsedConfig = parse(stdout, {
 			maxAliasCount: 10000,
+			merge: true,
 		}) as ComposeSpecification;
 		return parsedConfig;
 	} catch {
@@ -111,33 +121,138 @@ export const readComposeFile = async (compose: Compose) => {
 	return null;
 };
 
-export const writeDomainsToCompose = async (
+/**
+ * Where the expanded compose waits before the deploy script copies it into
+ * place. Next to `code/` (not inside it) so the clone, which wipes `code/`,
+ * can never delete it, and unique per deployment so two runs never share it.
+ */
+export const getStagedComposePath = (
+	compose: Pick<Compose, "appName" | "serverId">,
+	deploymentId?: string,
+) => {
+	const { COMPOSE_PATH } = paths(!!compose.serverId);
+	return join(
+		COMPOSE_PATH,
+		compose.appName,
+		`${STAGED_COMPOSE_PREFIX}${sanitizeStageId(deploymentId)}${STAGED_COMPOSE_SUFFIX}`,
+	);
+};
+
+/**
+ * Writes the compose to a staging file on the host that will run the deploy
+ * script (`compose.serverId`, or this machine when unset) and returns its path.
+ * The content goes through SFTP or `fs`, never through a command line: a single
+ * argument to `sh -c` is capped at 128 KB (MAX_ARG_STRLEN) on Linux, and an
+ * expanded compose can be larger than that. The file is created 0600 before it
+ * is filled.
+ */
+export const stageComposeFile = async ({
+	compose,
+	content,
+	deploymentId,
+	onStaged,
+}: {
+	compose: Pick<Compose, "appName" | "serverId">;
+	content: string;
+	deploymentId?: string;
+	onStaged?: StageOptions["onStaged"];
+}) => {
+	const stagedPath = getStagedComposePath(compose, deploymentId);
+	await stageFiles({
+		serverId: compose.serverId,
+		directory: dirname(stagedPath),
+		files: [{ path: stagedPath, content }],
+	});
+	onStaged?.([stagedPath]);
+	return stagedPath;
+};
+
+/**
+ * Shell snippet that copies the staged compose over the compose file and
+ * removes the staged file. It is removed on the failure path too, so a staged
+ * compose is never left behind; a failed copy aborts the script.
+ */
+export const getInstallStagedComposeCommand = (
+	stagedPath: string,
+	composePath: string,
+	alsoRemove: string[] = [],
+) =>
+	getInstallStagedFileCommand({
+		staged: stagedPath,
+		destination: composePath,
+		failureMessage: "❌ Error: Could not write the compose file",
+		alsoRemove,
+	});
+
+/**
+ * Builds the compose file the deploy runs (domain labels, randomize, isolated
+ * deployment). `content` is the YAML; `errorCommand` is the shell snippet that
+ * reports why there is none and stops the script.
+ */
+export const renderComposeWithDomains = async (
 	compose: Compose,
 	domains: Domain[],
-) => {
+): Promise<{ content: string } | { errorCommand: string }> => {
 	try {
 		const composeConverted = await addDomainToCompose(compose, domains);
-		const path = getComposePath(compose);
 
 		if (!composeConverted) {
-			return `
+			return {
+				errorCommand: `
 echo "❌ Error: Compose file not found";
 exit 1;
-			`;
+			`,
+			};
 		}
 
-		const composeString = stringify(composeConverted, { lineWidth: 1000 });
-		const encodedContent = encodeBase64(composeString);
-		return `echo "${encodedContent}" | base64 -d > "${path}";`;
+		return { content: stringify(composeConverted, { lineWidth: 1000 }) };
 	} catch (error) {
 		const message =
 			error instanceof Error ? error.message : String(error ?? "");
 		// The error message embeds user-controlled fields (e.g. serviceName) and is
 		// executed as part of the compose build shell script, so it must be escaped.
-		return `echo ${quote([`❌ Has occurred an error: ${message}`])};
+		return {
+			errorCommand: `echo ${quote([`❌ Has occurred an error: ${message}`])};
 exit 1;
-		`;
+		`,
+		};
 	}
+};
+
+/**
+ * Shell snippet for the deploy script that puts the rendered compose in place.
+ * The compose itself is staged out of band (see `stageComposeFile`): embedding
+ * it in the script used to fail with "Argument list too long" once the
+ * expanded compose passed ~96 KB.
+ */
+export const writeDomainsToCompose = async (
+	compose: Compose,
+	domains: Domain[],
+	options: StageOptions & {
+		/** Other files staged for the same script, removed if it stops early. */
+		alsoRemove?: string[];
+	} = {},
+) => {
+	const alsoRemove = options.alsoRemove ?? [];
+	const rendered = await renderComposeWithDomains(compose, domains);
+	if ("errorCommand" in rendered) {
+		// The script stops here: files staged for it would never be consumed.
+		return alsoRemove.length > 0
+			? `rm -f ${quote(alsoRemove)};${rendered.errorCommand}`
+			: rendered.errorCommand;
+	}
+
+	const stagedPath = await stageComposeFile({
+		compose,
+		content: rendered.content,
+		deploymentId: options.deploymentId,
+		onStaged: options.onStaged,
+	});
+	return getInstallStagedComposeCommand(
+		stagedPath,
+		getComposePath(compose),
+		alsoRemove,
+	);
 };
 export const applyComposeFilePatch = async (
 	compose: Compose,
@@ -164,6 +279,7 @@ export const applyComposeFilePatch = async (
 	try {
 		const parsed = parse(composeFilePatch.content, {
 			maxAliasCount: 10000,
+			merge: true,
 		}) as ComposeSpecification;
 		return parsed ?? null;
 	} catch {
@@ -208,6 +324,7 @@ export const addDomainToCompose = async (
 	if (compose.sourceType === "raw") {
 		result = parse(compose.composeFile, {
 			maxAliasCount: 10000,
+			merge: true,
 		}) as ComposeSpecification;
 	} else if (compose.serverId) {
 		result = await loadDockerComposeRemote(compose);
@@ -254,12 +371,18 @@ export const addDomainToCompose = async (
 	for (const domain of domains.filter((d) => d.enabled)) {
 		const { serviceName, https } = domain;
 		if (!serviceName) {
-			throw new Error(`Domain "${domain.host}" is missing a service name`);
+			throw new TRPCError({
+				code: "BAD_REQUEST",
+				message: `Domain "${domain.host}" is missing a service name`,
+			});
 		}
 		if (!result?.services?.[serviceName]) {
-			throw new Error(
-				`Domain "${domain.host}" is attached to service "${serviceName}" which does not exist in the compose`,
-			);
+			// A domain pointing at a service the compose file no longer defines is
+			// a configuration problem the user fixes, not a server failure.
+			throw new TRPCError({
+				code: "BAD_REQUEST",
+				message: `Domain "${domain.host}" is attached to service "${serviceName}" which does not exist in the compose`,
+			});
 		}
 
 		const httpLabels = createDomainLabels(
@@ -539,6 +662,10 @@ export const addDokployNetworkToService = (
 	const hadExplicitNetworks = networkService !== undefined;
 	if (!networks) {
 		networks = [];
+	} else if (Array.isArray(networks)) {
+		networks = [...networks];
+	} else if (typeof networks === "object") {
+		networks = { ...networks };
 	}
 
 	if (Array.isArray(networks)) {

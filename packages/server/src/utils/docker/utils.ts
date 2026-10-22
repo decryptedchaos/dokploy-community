@@ -17,6 +17,12 @@ import type { RedisNested } from "../databases/redis";
 import { execAsync, execAsyncRemote } from "../process/execAsync";
 import { spawnAsync } from "../process/spawnAsync";
 import { getRemoteDocker } from "../servers/remote-docker";
+import {
+	getInstallStagedFileCommand,
+	getStagedFilePath,
+	type StageOptions,
+	stageFiles,
+} from "./staging";
 
 interface RegistryAuth {
 	username: string;
@@ -903,6 +909,11 @@ export const createFile = async (
 export const encodeBase64 = (content: string) =>
 	Buffer.from(content, "utf-8").toString("base64");
 
+/**
+ * Inline variant: the content travels inside the script, so it is only for
+ * small, fixed content (the static builder's nginx.conf / Dockerfile). User
+ * content (file mounts) goes through `getCreateFilesCommand`.
+ */
 export const getCreateFileCommand = (
 	outputPath: string,
 	filePath: string,
@@ -919,6 +930,83 @@ export const getCreateFileCommand = (
 		mkdir -p ${quote([directory])};
 		echo "${encodedContent}" | base64 -d > ${quote([fullPath])};
 	`;
+};
+
+/**
+ * Shell commands that create `files` under `outputPath` on the host that runs
+ * them (`serverId`, or this machine when unset). A `filePath` ending in `/` is
+ * a directory. File content is staged out of band (see `./staging`) and copied
+ * in with `cat >`, so it never counts toward the 128 KB limit on a single shell
+ * argument, no matter how many files a script creates. The staged files sit
+ * next to `outputPath`, not in it: it is bind-mounted into containers.
+ */
+export const getCreateFilesCommand = async ({
+	serverId,
+	outputPath,
+	files,
+	replaceDirectory = false,
+	deploymentId,
+	onStaged,
+}: {
+	serverId?: string | null;
+	outputPath: string;
+	files: { filePath: string; content: string }[];
+	/** Remove a directory that sits where a file is to be written. */
+	replaceDirectory?: boolean;
+} & StageOptions) => {
+	const stageDirectory = path.dirname(outputPath);
+	const entries = files.map((file) => {
+		const fullPath = path.join(outputPath, file.filePath);
+		return {
+			fullPath,
+			content: file.content,
+			isDirectory: fullPath.endsWith(path.sep) || file.filePath.endsWith("/"),
+		};
+	});
+
+	const toStage = entries.filter((entry) => !entry.isDirectory);
+	const stagedPaths = toStage.map((_, index) =>
+		getStagedFilePath({
+			directory: stageDirectory,
+			kind: "mount",
+			deploymentId,
+			index,
+		}),
+	);
+	await stageFiles({
+		serverId,
+		directory: stageDirectory,
+		files: toStage.map((entry, index) => ({
+			path: stagedPaths[index] as string,
+			content: entry.content,
+		})),
+	});
+	if (stagedPaths.length > 0) onStaged?.(stagedPaths);
+
+	let stagedIndex = 0;
+	let command = "";
+	for (const entry of entries) {
+		if (entry.isDirectory) {
+			command += `mkdir -p ${quote([entry.fullPath])};`;
+			continue;
+		}
+		const qFullPath = quote([entry.fullPath]);
+		const makeDirectory = `mkdir -p ${quote([path.dirname(entry.fullPath)])}`;
+		command += `
+		${getInstallStagedFileCommand({
+			staged: stagedPaths[stagedIndex] as string,
+			destination: entry.fullPath,
+			failureMessage: "❌ Error: Could not write a file mount",
+			prepare: replaceDirectory
+				? `${makeDirectory} && { if [ -d ${qFullPath} ]; then rm -rf ${qFullPath}; fi; }`
+				: makeDirectory,
+			// A failed write stops the script: the rest never get consumed.
+			alsoRemove: stagedPaths,
+		})}
+	`;
+		stagedIndex++;
+	}
+	return command;
 };
 
 export const getServiceContainer = async (
@@ -1060,8 +1148,17 @@ export type SwarmStabilityResult =
 	// rolling update the outgoing and incoming tasks briefly share that label,
 	// so a label lookup can return the container that is about to go away.
 	// Optional because Swarm may not have populated `ContainerStatus` yet.
-	| { stable: true; containerId?: string }
-	| { stable: false; reason: string };
+	{ stable: true; containerId?: string } | { stable: false; reason: string };
+
+// Swarm task states that precede `running`; `preparing` covers the image pull.
+const PRE_RUNNING_TASK_STATES = [
+	"new",
+	"pending",
+	"assigned",
+	"accepted",
+	"preparing",
+	"starting",
+];
 
 export const waitForSwarmServiceStable = async (
 	appName: string,
@@ -1069,7 +1166,20 @@ export const waitForSwarmServiceStable = async (
 		serverId,
 		windowMs = 60_000,
 		pollMs = 5_000,
-	}: { serverId?: string | null; windowMs?: number; pollMs?: number } = {},
+		maxWaitMs = 10 * 60_000,
+		postRunningObserveMs = 30_000,
+	}: {
+		serverId?: string | null;
+		windowMs?: number;
+		pollMs?: number;
+		// Upper bound (measured from the poll start) while the newest task is
+		// still in a pre-running state, i.e. the node is pulling a large image.
+		maxWaitMs?: number;
+		// Minimum observation time after the first `running` moment of a deploy
+		// whose window was extended for an image pull, so a crash-on-boot is
+		// still caught.
+		postRunningObserveMs?: number;
+	} = {},
 ): Promise<SwarmStabilityResult> => {
 	const remoteDocker = await getRemoteDocker(serverId);
 
@@ -1091,7 +1201,15 @@ export const waitForSwarmServiceStable = async (
 
 	const pollStartMs = Date.now();
 	const daemonPollStartMs = pollStartMs + clockOffsetMs;
-	const deadline = pollStartMs + windowMs;
+	const baseDeadline = pollStartMs + windowMs;
+	// Hard cap for the image-pull extension; never below the base window.
+	const maxDeadline = pollStartMs + Math.max(windowMs, maxWaitMs);
+	let deadline = baseDeadline;
+	// Set once the window was stretched because the newest task is still
+	// pulling/starting and nothing from this deployment has run yet.
+	let extendedForPull = false;
+	let lastPreRunningState: string | undefined;
+	let lastPreRunningMessage = "";
 	let everRunning = false;
 	let lastRunningContainerId: string | undefined;
 	let lastReason = "Service did not reach running state";
@@ -1154,24 +1272,32 @@ export const waitForSwarmServiceStable = async (
 				(t) => t.Status?.State === "running",
 			).length;
 			const startingCount = active.filter((t) =>
-				[
-					"new",
-					"pending",
-					"assigned",
-					"accepted",
-					"preparing",
-					"starting",
-				].includes(t.Status?.State ?? ""),
+				PRE_RUNNING_TASK_STATES.includes(t.Status?.State ?? ""),
 			).length;
 
+			const latestIsPreRunning = PRE_RUNNING_TASK_STATES.includes(state ?? "");
+			if (runningCount === 0 && !everRunning && latestIsPreRunning) {
+				// Nothing from this deployment has run yet and the newest task is
+				// still pulling/starting (a large image from the registry can take
+				// well over the base window). Keep waiting, bounded by maxWaitMs.
+				extendedForPull = true;
+				lastPreRunningState = state;
+				lastPreRunningMessage = message;
+				deadline = maxDeadline;
+			}
+
 			if (runningCount > 0) {
+				if (!everRunning && extendedForPull) {
+					// First running moment after an extended wait: observe for at
+					// least `postRunningObserveMs` so a crash-on-boot is still
+					// caught, without ever shrinking the original window.
+					deadline = Math.max(baseDeadline, Date.now() + postRunningObserveMs);
+				}
 				everRunning = true;
 				// `sorted` is the active task set newest-first, so this tracks the
 				// most recently updated running task — the one this deployment
 				// just brought up.
-				const newestRunning = sorted.find(
-					(t) => t.Status?.State === "running",
-				);
+				const newestRunning = sorted.find((t) => t.Status?.State === "running");
 				const containerId = newestRunning?.Status?.ContainerStatus?.ContainerID;
 				if (containerId) {
 					lastRunningContainerId = containerId;
@@ -1185,11 +1311,12 @@ export const waitForSwarmServiceStable = async (
 				};
 			}
 
-			lastReason = active.length === 0
-				? "No tasks from this deployment found"
-				: message
-					? `Latest task state: ${state ?? "unknown"} (${message})`
-					: `Latest task state: ${state ?? "unknown"}`;
+			lastReason =
+				active.length === 0
+					? "No tasks from this deployment found"
+					: message
+						? `Latest task state: ${state ?? "unknown"} (${message})`
+						: `Latest task state: ${state ?? "unknown"}`;
 		} catch (error) {
 			lastReason =
 				error instanceof Error ? error.message : "Failed to inspect service";
@@ -1207,6 +1334,14 @@ export const waitForSwarmServiceStable = async (
 			...(lastRunningContainerId
 				? { containerId: lastRunningContainerId }
 				: {}),
+		};
+	}
+	if (extendedForPull) {
+		return {
+			stable: false,
+			reason: `Task still ${lastPreRunningState ?? "starting"} (image pull) after ${Math.max(windowMs, maxWaitMs)}ms${
+				lastPreRunningMessage ? `: ${lastPreRunningMessage}` : ""
+			}`,
 		};
 	}
 	return { stable: false, reason: lastReason };

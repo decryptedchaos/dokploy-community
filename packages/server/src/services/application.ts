@@ -27,12 +27,19 @@ import {
 import { cloneGiteaRepository } from "@dokploy/server/utils/providers/gitea";
 import { cloneGithubRepository } from "@dokploy/server/utils/providers/github";
 import { cloneGitlabRepository } from "@dokploy/server/utils/providers/gitlab";
+import { buildPreviewHeadRef } from "@dokploy/server/utils/providers/head-ref";
+import {
+	getPreviewSourceMismatchMessage,
+	PREVIEW_IMAGE_TEMPLATE_REQUIRED_MESSAGE,
+	resolvePreviewDockerImage,
+} from "@dokploy/server/utils/preview-image";
 import { createTraefikConfig } from "@dokploy/server/utils/traefik/application";
 import { TRPCError } from "@trpc/server";
 import { eq } from "drizzle-orm";
 import type { z } from "zod";
 import { deployHook } from "../db/schema";
 import { parseDeployHooks, runDeployHook } from "../utils/docker/hooks";
+import { removeStagedFiles } from "../utils/docker/staging";
 import { encodeBase64, waitForSwarmServiceStable } from "../utils/docker/utils";
 import { getDokployUrl } from "./admin";
 // Fork module: enforced remote builds. See services/build-policy/README.md.
@@ -52,6 +59,18 @@ import {
 	updateDeployment,
 	updateDeploymentStatus,
 } from "./deployment";
+import {
+	appendLogLine,
+	assertBuildNotCancelled,
+	CANCELLED_THEN_FAILED_NOTE,
+	CANCELLED_TOO_LATE_NOTE,
+	DeploymentCancelledError,
+	isDeploymentCancelled,
+	isDeploymentCancelledError,
+	markDeploymentDoneUnlessCancelled,
+	runRemoteBuildScript,
+	statusAfterCancelledDeploy,
+} from "./deployment-cancel";
 import { type Domain, getDomainHost } from "./domain";
 import { getIssueComment } from "./github";
 import { generateApplyPatchesCommand } from "./patch";
@@ -65,7 +84,7 @@ import {
 	updatePreviewDeployment,
 } from "./preview-deployment";
 import { validUniqueServerAppName } from "./project";
-import { registerPreviewDeployment } from "./snapvisor";
+import { finalizePreviewBuildMetadata } from "./snapvisor";
 export type Application = typeof applications.$inferSelect;
 
 export const createApplication = async (
@@ -192,6 +211,29 @@ export const updateApplicationStatus = async (
 	return application;
 };
 
+/**
+ * A cancelled build-server deployment ends here instead of in the generic
+ * failure path: it stays `cancelled` (not `error`), sends no build-error
+ * notification, and the application goes back to idle. Returns the error to
+ * rethrow, or `null` when this was not a cancellation.
+ *
+ * Only a `DeploymentCancelledError` counts. A cancel that arrives too late
+ * (the release is already starting) leaves the row `cancelled`, but if the
+ * release then genuinely fails, that failure must not read as a cancel: it
+ * takes the normal failure path (error status, notification) and the log notes
+ * the earlier cancel request.
+ */
+const settleCancelledApplicationDeploy = async (
+	applicationId: string,
+	deployment: { deploymentId: string; buildServerId?: string | null },
+	error: unknown,
+) => {
+	if (!deployment.buildServerId) return null;
+	if (!isDeploymentCancelledError(error)) return null;
+	const settledStatus = await statusAfterCancelledDeploy({ applicationId });
+	await updateApplicationStatus(applicationId, settledStatus);
+	return new DeploymentCancelledError(undefined, { settledStatus });
+};
 export const deployApplication = async ({
 	applicationId,
 	titleLog = "Manual deployment",
@@ -240,6 +282,7 @@ export const deployApplication = async ({
 		{ buildServerId: buildPolicy.buildServerId },
 	);
 
+	const stagedBuildFiles: string[] = [];
 	try {
 		let command = "set -e;";
 		if (application.sourceType === "github") {
@@ -253,15 +296,18 @@ export const deployApplication = async ({
 		} else if (application.sourceType === "git") {
 			command += await cloneGitRepository(applicationEntity);
 		} else if (application.sourceType === "docker") {
-			command += await buildRemoteDocker(application);
+			command += await buildRemoteDocker(application, serverId);
 		}
 
 		if (application.sourceType !== "docker") {
-			command += await generateApplyPatchesCommand({
-				id: application.applicationId,
-				type: "application",
-				serverId,
-			});
+			command += await generateApplyPatchesCommand(
+				{
+					id: application.applicationId,
+					type: "application",
+					serverId,
+				},
+				{ deploymentId: deployment.deploymentId },
+			);
 		}
 
 		// >>> build-policy hook 2a/4: the required-checks gate, between the clone
@@ -277,7 +323,10 @@ export const deployApplication = async ({
 		});
 		// <<< build-policy hook 2a/4
 
-		command += await getBuildCommand(application);
+		command += await getBuildCommand(application, serverId, {
+			deploymentId: deployment.deploymentId,
+			onStaged: (paths) => stagedBuildFiles.push(...paths),
+		});
 
 		// >>> build-policy hook 2/4: tag `<repository>:<sha>`, push to the
 		// organization registry and echo the digest. Empty when not enforcing.
@@ -289,10 +338,11 @@ export const deployApplication = async ({
 
 		const commandWithLog = `(${command}) >> ${deployment.logPath} 2>&1`;
 		if (serverId) {
-			await execAsyncRemote(serverId, commandWithLog);
+			await runRemoteBuildScript(serverId, commandWithLog, deployment);
 		} else {
 			await execAsync(commandWithLog);
 		}
+		await assertBuildNotCancelled(deployment);
 
 		// >>> build-policy hook 3/4: gate on required checks, then pin the deploy
 		// to the digest that was just published. Identity when not enforcing.
@@ -313,6 +363,7 @@ export const deployApplication = async ({
 		// on the deploy host. `serverId` above is `buildServerId || serverId` —
 		// using it here would target the build server, where the container is
 		// absent (pre would silently no-op, post would throw).
+		await assertBuildNotCancelled(deployment);
 		await runDeployHook({
 			kind: "pre",
 			appName: application.appName,
@@ -324,6 +375,9 @@ export const deployApplication = async ({
 
 		// build-policy hook 4/4: `deployTarget` is `application` plus the pinned
 		// digest when a remote build was enforced. See hook 3/4 above.
+		// The pre-deploy hook can take a while: a cancel meanwhile must stop the
+		// container from being replaced.
+		await assertBuildNotCancelled(deployment);
 		await mechanizeDockerContainer(deployTarget);
 
 		const stability = await waitForSwarmServiceStable(application.appName, {
@@ -347,19 +401,46 @@ export const deployApplication = async ({
 			});
 		}
 
-		await updateDeploymentStatus(deployment.deploymentId, "done");
+		// A cancel that landed while the container was being replaced cannot be
+		// honoured (the release is already running); it stays recorded as
+		// cancelled instead of being overwritten by "done".
+		let finished = true;
+		if (deployment.buildServerId) {
+			finished = await markDeploymentDoneUnlessCancelled(
+				deployment.deploymentId,
+			);
+		} else {
+			await updateDeploymentStatus(deployment.deploymentId, "done");
+		}
 		await updateApplicationStatus(applicationId, "done");
 
-		await sendBuildSuccessNotifications({
-			projectName: application.environment.project.name,
-			applicationName: application.name,
-			applicationType: "application",
-			buildLink,
-			organizationId: application.environment.project.organizationId,
-			domains: application.domains,
-			environmentName: application.environment.name,
-		});
+		if (!finished) {
+			await appendLogLine(
+				deployment.buildServerId,
+				deployment.logPath,
+				CANCELLED_TOO_LATE_NOTE,
+			);
+		} else {
+			await sendBuildSuccessNotifications({
+				projectName: application.environment.project.name,
+				applicationName: application.name,
+				applicationType: "application",
+				serviceId: applicationId,
+				buildLink,
+				organizationId: application.environment.project.organizationId,
+				domains: application.domains,
+				environmentName: application.environment.name,
+			});
+		}
 	} catch (error) {
+		void removeStagedFiles(serverId, stagedBuildFiles);
+		const cancelled = await settleCancelledApplicationDeploy(
+			applicationId,
+			deployment,
+			error,
+		);
+		if (cancelled) throw cancelled;
+
 		let command = "";
 
 		// Only log details for non-ExecError errors
@@ -369,6 +450,14 @@ export const deployApplication = async ({
 			command += `echo "${encodedMessage}" | base64 -d >> "${deployment.logPath}";`;
 		}
 
+		// A cancel that came too late, followed by a real failure: say so, the
+		// deployment ends as `error` (it did fail), not `cancelled`.
+		if (
+			deployment.buildServerId &&
+			(await isDeploymentCancelled(deployment.deploymentId))
+		) {
+			command += `echo "\n${CANCELLED_THEN_FAILED_NOTE}" >> ${deployment.logPath};`;
+		}
 		command += `echo "\nError occurred ❌, check the logs for details." >> ${deployment.logPath};`;
 		if (serverId) {
 			await execAsyncRemote(serverId, command);
@@ -388,6 +477,7 @@ export const deployApplication = async ({
 			projectName: application.environment.project.name,
 			applicationName: application.name,
 			applicationType: "application",
+			serviceId: applicationId,
 			errorMessage,
 			buildLink,
 			organizationId: application.environment.project.organizationId,
@@ -453,6 +543,7 @@ export const rebuildApplication = async ({
 		{ buildServerId: buildPolicy.buildServerId },
 	);
 
+	const stagedBuildFiles: string[] = [];
 	try {
 		let command = "set -e;";
 		// >>> build-policy hook 2a/4 (rebuild): the required-checks gate. A
@@ -467,7 +558,10 @@ export const rebuildApplication = async ({
 		});
 		// <<< build-policy hook 2a/4 (rebuild)
 		// Check case for docker only
-		command += await getBuildCommand(application);
+		command += await getBuildCommand(application, serverId, {
+			deploymentId: deployment.deploymentId,
+			onStaged: (paths) => stagedBuildFiles.push(...paths),
+		});
 		// >>> build-policy hook 2/4 (rebuild)
 		command += await getBuildPolicyPushCommand(buildPolicy, {
 			appName: application.appName,
@@ -476,10 +570,11 @@ export const rebuildApplication = async ({
 		// <<< build-policy hook 2/4
 		const commandWithLog = `(${command}) >> ${deployment.logPath} 2>&1`;
 		if (serverId) {
-			await execAsyncRemote(serverId, commandWithLog);
+			await runRemoteBuildScript(serverId, commandWithLog, deployment);
 		} else {
 			await execAsync(commandWithLog);
 		}
+		await assertBuildNotCancelled(deployment);
 
 		// >>> build-policy hook 3/4 (rebuild)
 		const deployTarget = await prepareBuildPolicyDeploy({
@@ -497,6 +592,7 @@ export const rebuildApplication = async ({
 
 		// See deployApplication: hooks must target the deploy host
 		// (`application.serverId`), never the build server.
+		await assertBuildNotCancelled(deployment);
 		await runDeployHook({
 			kind: "pre",
 			appName: application.appName,
@@ -507,6 +603,9 @@ export const rebuildApplication = async ({
 		});
 
 		// build-policy hook 4/4 (rebuild): see hook 3/4 above.
+		// The pre-deploy hook can take a while: a cancel meanwhile must stop the
+		// container from being replaced.
+		await assertBuildNotCancelled(deployment);
 		await mechanizeDockerContainer(deployTarget);
 
 		const stability = await waitForSwarmServiceStable(application.appName, {
@@ -530,19 +629,46 @@ export const rebuildApplication = async ({
 			});
 		}
 
-		await updateDeploymentStatus(deployment.deploymentId, "done");
+		// A cancel that landed while the container was being replaced cannot be
+		// honoured (the release is already running); it stays recorded as
+		// cancelled instead of being overwritten by "done".
+		let finished = true;
+		if (deployment.buildServerId) {
+			finished = await markDeploymentDoneUnlessCancelled(
+				deployment.deploymentId,
+			);
+		} else {
+			await updateDeploymentStatus(deployment.deploymentId, "done");
+		}
 		await updateApplicationStatus(applicationId, "done");
 
-		await sendBuildSuccessNotifications({
-			projectName: application.environment.project.name,
-			applicationName: application.name,
-			applicationType: "application",
-			buildLink,
-			organizationId: application.environment.project.organizationId,
-			domains: application.domains,
-			environmentName: application.environment.name,
-		});
+		if (!finished) {
+			await appendLogLine(
+				deployment.buildServerId,
+				deployment.logPath,
+				CANCELLED_TOO_LATE_NOTE,
+			);
+		} else {
+			await sendBuildSuccessNotifications({
+				projectName: application.environment.project.name,
+				applicationName: application.name,
+				applicationType: "application",
+				serviceId: applicationId,
+				buildLink,
+				organizationId: application.environment.project.organizationId,
+				domains: application.domains,
+				environmentName: application.environment.name,
+			});
+		}
 	} catch (error) {
+		void removeStagedFiles(serverId, stagedBuildFiles);
+		const cancelled = await settleCancelledApplicationDeploy(
+			applicationId,
+			deployment,
+			error,
+		);
+		if (cancelled) throw cancelled;
+
 		let command = "";
 
 		// Only log details for non-ExecError errors
@@ -552,6 +678,14 @@ export const rebuildApplication = async ({
 			command += `echo "${encodedMessage}" | base64 -d >> "${deployment.logPath}";`;
 		}
 
+		// A cancel that came too late, followed by a real failure: say so, the
+		// deployment ends as `error` (it did fail), not `cancelled`.
+		if (
+			deployment.buildServerId &&
+			(await isDeploymentCancelled(deployment.deploymentId))
+		) {
+			command += `echo "\n${CANCELLED_THEN_FAILED_NOTE}" >> ${deployment.logPath};`;
+		}
 		command += `echo "\nError occurred ❌, check the logs for details." >> ${deployment.logPath};`;
 		if (serverId) {
 			await execAsyncRemote(serverId, command);
@@ -570,6 +704,37 @@ const resolvePreviewTemplateVariables = (
 	value: string,
 	pullRequestNumber: string,
 ) => value.replaceAll("${{preview.prNumber}}", pullRequestNumber);
+
+/**
+ * Previews of a Docker-image application have no repository to clone: CI pushes
+ * an image for the change and the preview pulls it. The image comes from the
+ * application's preview image template, with `${{preview.prNumber}}` replaced
+ * by the preview's identifier, and the pull reuses the application's registry
+ * credentials like a regular Docker-image deploy does. Every (re)deploy pulls
+ * again, so a tag that CI re-pushes is picked up by redeploying the preview.
+ */
+const buildPreviewDockerPullCommand = async ({
+	application,
+	identifier,
+	serverId,
+}: {
+	application: Parameters<typeof buildRemoteDocker>[0];
+	identifier: string;
+	serverId: string | null | undefined;
+}) => {
+	const image = resolvePreviewDockerImage(
+		application.previewDockerImage,
+		identifier,
+	);
+	if (!image) {
+		throw new TRPCError({
+			code: "BAD_REQUEST",
+			message: PREVIEW_IMAGE_TEMPLATE_REQUIRED_MESSAGE,
+		});
+	}
+	application.dockerImage = image;
+	return await buildRemoteDocker(application, serverId);
+};
 
 /**
  * Build a writer that keeps the pull request comment of a preview deployment up
@@ -635,50 +800,6 @@ const buildPreviewCommentWriter = ({
 	};
 };
 
-/**
- * After a preview build succeeds: records the commit it built using the same
- * `Commit: <sha>` marker `deployApplication`'s `finally` block writes for
- * regular deploys (read back by `findLatestPreviewCommitSha` in
- * `services/snapvisor.ts`), then best-effort links the Snapvisor build for
- * that commit. Neither step may fail the deploy: commit extraction mirrors
- * the existing non-preview convention exactly, and the Snapvisor call is
- * fire-and-forget with its own `.catch`.
- */
-const finalizePreviewBuildMetadata = async ({
-	application,
-	previewDeploymentId,
-	appName,
-	deploymentId,
-	serverId,
-}: {
-	application: Pick<Application, "sourceType">;
-	previewDeploymentId: string;
-	appName: string;
-	deploymentId: string;
-	serverId: string | null;
-}) => {
-	if (application.sourceType !== "docker") {
-		const commitInfo = await getGitCommitInfo({
-			appName,
-			type: "application",
-			serverId,
-		});
-		if (commitInfo) {
-			await updateDeployment(deploymentId, {
-				title: commitInfo.message,
-				description: `Commit: ${commitInfo.hash}`,
-			});
-		}
-	}
-
-	registerPreviewDeployment({ previewDeploymentId }).catch((error) => {
-		console.error(
-			"Error registering the Snapvisor preview deployment:",
-			error,
-		);
-	});
-};
-
 export const deployPreviewApplication = async ({
 	applicationId,
 	titleLog = "Preview Deployment",
@@ -732,12 +853,24 @@ export const deployPreviewApplication = async ({
 		previewDeploymentId,
 		previewDomain,
 	});
+	const stagedBuildFiles: string[] = [];
+	let stagedBuildServerId: string | null | undefined;
 	try {
 		await writePreviewComment("running");
 
 		// build-policy hook 1/4 (preview), continued: refusing here rather than
 		// above means the preview status, the log and the PR comment all say why.
 		if (!buildPolicy) throw buildPolicyError;
+
+		// A preview row only fits the source it was created for (see
+		// getPreviewSourceMismatchMessage); refuse before cloning or pulling.
+		const sourceMismatch = getPreviewSourceMismatchMessage(
+			application.sourceType === "docker",
+			previewDeployment.pullRequestId,
+		);
+		if (sourceMismatch) {
+			throw new TRPCError({ code: "BAD_REQUEST", message: sourceMismatch });
+		}
 
 		application.appName = previewDeployment.appName;
 		application.env = resolvePreviewTemplateVariables(
@@ -760,7 +893,12 @@ export const deployPreviewApplication = async ({
 			application.buildRegistry = null;
 		}
 		application.rollbackRegistry = null;
-		application.registry = null;
+		// A Docker-image preview keeps the registry: it carries the credentials
+		// the image is pulled with, and nothing is pushed back to it.
+		const isDockerPreview = application.sourceType === "docker";
+		if (!isDockerPreview) {
+			application.registry = null;
+		}
 
 		const buildServerId =
 			buildPolicy.buildServerId ||
@@ -771,23 +909,38 @@ export const deployPreviewApplication = async ({
 			serverId: buildServerId,
 		};
 		let command = "set -e;";
-		if (application.sourceType === "github") {
+		// Preview checkouts resolve the pull-request head ref (fork-safe) — see
+		// utils/providers/head-ref.ts. Falls back to the branch when null.
+		const previewHeadRef = buildPreviewHeadRef(
+			application.sourceType,
+			previewDeployment.pullRequestNumber,
+		);
+		if (isDockerPreview) {
+			command += await buildPreviewDockerPullCommand({
+				application,
+				identifier: previewDeployment.pullRequestNumber,
+				serverId: buildServerId,
+			});
+		} else if (application.sourceType === "github") {
 			command += await cloneGithubRepository({
 				...applicationEntity,
 				appName: previewDeployment.appName,
 				branch: previewDeployment.branch,
+				headRef: previewHeadRef,
 			});
 		} else if (application.sourceType === "gitlab") {
 			command += await cloneGitlabRepository({
 				...applicationEntity,
 				appName: previewDeployment.appName,
 				gitlabBranch: previewDeployment.branch,
+				headRef: previewHeadRef,
 			});
 		} else if (application.sourceType === "gitea") {
 			command += await cloneGiteaRepository({
 				...applicationEntity,
 				appName: previewDeployment.appName,
 				giteaBranch: previewDeployment.branch,
+				headRef: previewHeadRef,
 			});
 		} else {
 			throw new TRPCError({
@@ -807,7 +960,18 @@ export const deployPreviewApplication = async ({
 		});
 		// <<< build-policy hook 2a/4 (preview)
 
-		command += await getBuildCommand(application);
+		// A pulled image needs no build, and must not be re-tagged and pushed to
+		// the application's registry either.
+		if (!isDockerPreview) {
+			command += await getBuildCommand(application, buildServerId, {
+				deploymentId: deployment.deploymentId,
+				// `buildServerId` is only in scope here: remember the host the files are on.
+				onStaged: (paths) => {
+					stagedBuildServerId = buildServerId;
+					stagedBuildFiles.push(...paths);
+				},
+			});
+		}
 
 		// >>> build-policy hook 2/4 (preview): tag and push the preview image by
 		// sha. Empty when not enforcing.
@@ -837,7 +1001,8 @@ export const deployPreviewApplication = async ({
 		await mechanizeDockerContainer(deployTarget);
 
 		await finalizePreviewBuildMetadata({
-			application,
+			type: "application",
+			hasGitSource: application.sourceType !== "docker",
 			previewDeploymentId,
 			appName: previewDeployment.appName,
 			deploymentId: deployment.deploymentId,
@@ -850,6 +1015,7 @@ export const deployPreviewApplication = async ({
 			previewStatus: "done",
 		});
 	} catch (error) {
+		void removeStagedFiles(stagedBuildServerId, stagedBuildFiles);
 		let command = "";
 		if (!(error instanceof ExecError)) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -857,7 +1023,8 @@ export const deployPreviewApplication = async ({
 			command += `echo "${encodedMessage}" | base64 -d >> "${deployment.logPath}";`;
 		}
 		command += `echo "\nError occurred ❌, check the logs for details." >> ${deployment.logPath};`;
-		const buildServerId = application.buildServerId || application.serverId;
+		// The log lives where the deployment was built; the row records it.
+		const buildServerId = deployment.buildServerId || deployment.serverId;
 		try {
 			if (buildServerId) {
 				await execAsyncRemote(buildServerId, command);
@@ -930,11 +1097,23 @@ export const rebuildPreviewApplication = async ({
 		previewDomain,
 	});
 
+	const stagedBuildFiles: string[] = [];
+	let stagedBuildServerId: string | null | undefined;
 	try {
 		await writePreviewComment("running");
 
 		// build-policy hook 1/4 (preview rebuild), continued.
 		if (!buildPolicy) throw buildPolicyError;
+
+		// A preview row only fits the source it was created for (see
+		// getPreviewSourceMismatchMessage); refuse before cloning or pulling.
+		const sourceMismatch = getPreviewSourceMismatchMessage(
+			application.sourceType === "docker",
+			previewDeployment.pullRequestId,
+		);
+		if (sourceMismatch) {
+			throw new TRPCError({ code: "BAD_REQUEST", message: sourceMismatch });
+		}
 
 		// Set application properties for preview deployment
 		application.appName = previewDeployment.appName;
@@ -958,7 +1137,12 @@ export const rebuildPreviewApplication = async ({
 			application.buildRegistry = null;
 		}
 		application.rollbackRegistry = null;
-		application.registry = null;
+		// A Docker-image preview keeps the registry: it carries the credentials
+		// the image is pulled with, and nothing is pushed back to it.
+		const isDockerPreview = application.sourceType === "docker";
+		if (!isDockerPreview) {
+			application.registry = null;
+		}
 
 		const buildServerId =
 			buildPolicy.buildServerId ||
@@ -976,23 +1160,37 @@ export const rebuildPreviewApplication = async ({
 		// cache-hits every layer including `COPY . .` and the deploy
 		// finishes in seconds while still serving the original commit.
 		// Symmetric with `deployPreviewApplication` above.
-		if (application.sourceType === "github") {
+		const previewHeadRef = buildPreviewHeadRef(
+			application.sourceType,
+			previewDeployment.pullRequestNumber,
+		);
+		if (isDockerPreview) {
+			// Pull the image again: CI may have re-pushed the tag since.
+			command += await buildPreviewDockerPullCommand({
+				application,
+				identifier: previewDeployment.pullRequestNumber,
+				serverId: buildServerId,
+			});
+		} else if (application.sourceType === "github") {
 			command += await cloneGithubRepository({
 				...applicationEntity,
 				appName: previewDeployment.appName,
 				branch: previewDeployment.branch,
+				headRef: previewHeadRef,
 			});
 		} else if (application.sourceType === "gitlab") {
 			command += await cloneGitlabRepository({
 				...applicationEntity,
 				appName: previewDeployment.appName,
 				gitlabBranch: previewDeployment.branch,
+				headRef: previewHeadRef,
 			});
 		} else if (application.sourceType === "gitea") {
 			command += await cloneGiteaRepository({
 				...applicationEntity,
 				appName: previewDeployment.appName,
 				giteaBranch: previewDeployment.branch,
+				headRef: previewHeadRef,
 			});
 		} else {
 			throw new TRPCError({
@@ -1010,7 +1208,18 @@ export const rebuildPreviewApplication = async ({
 			appName: previewDeployment.appName,
 		});
 		// <<< build-policy hook 2a/4 (preview rebuild)
-		command += await getBuildCommand(application);
+		// A pulled image needs no build, and must not be re-tagged and pushed to
+		// the application's registry either.
+		if (!isDockerPreview) {
+			command += await getBuildCommand(application, buildServerId, {
+				deploymentId: deployment.deploymentId,
+				// `buildServerId` is only in scope here: remember the host the files are on.
+				onStaged: (paths) => {
+					stagedBuildServerId = buildServerId;
+					stagedBuildFiles.push(...paths);
+				},
+			});
+		}
 		// >>> build-policy hook 2/4 (preview rebuild)
 		command += await getBuildPolicyPushCommand(buildPolicy, {
 			appName: previewDeployment.appName,
@@ -1035,7 +1244,8 @@ export const rebuildPreviewApplication = async ({
 		await mechanizeDockerContainer(deployTarget);
 
 		await finalizePreviewBuildMetadata({
-			application,
+			type: "application",
+			hasGitSource: application.sourceType !== "docker",
 			previewDeploymentId,
 			appName: previewDeployment.appName,
 			deploymentId: deployment.deploymentId,
@@ -1048,6 +1258,7 @@ export const rebuildPreviewApplication = async ({
 			previewStatus: "done",
 		});
 	} catch (error) {
+		void removeStagedFiles(stagedBuildServerId, stagedBuildFiles);
 		let command = "";
 
 		// Only log details for non-ExecError errors
@@ -1058,7 +1269,8 @@ export const rebuildPreviewApplication = async ({
 		}
 
 		command += `echo "\nError occurred ❌, check the logs for details." >> ${deployment.logPath};`;
-		const serverId = application.buildServerId || application.serverId;
+		// The log lives where the deployment was built; the row records it.
+		const serverId = deployment.buildServerId || deployment.serverId;
 		if (serverId) {
 			await execAsyncRemote(serverId, command);
 		} else {

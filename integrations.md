@@ -58,6 +58,15 @@ The Integrations page (`/dashboard/settings/integrations`) shows cards for Uptim
 - Monitors cannot be deleted from Dokploy, because Uptimely's API has no monitor delete. **Unlink** only makes Dokploy forget the monitors for that service. Disconnecting the integration removes the stored API key and every link. In both cases the monitors keep running in Uptimely until you delete them there.
 - One Uptimely project is connected per organization.
 
+**Deploy heartbeat (applications and compose stacks)**
+
+The panel has an optional **Deploy heartbeat**. Press **Add deploy heartbeat** to create an Incoming Request monitor in Uptimely. After every successful deploy, Dokploy pings that monitor, so Uptimely alerts you when a service stops deploying on schedule.
+
+- Uptimely does not share a heartbeat monitor's secret over its API. After the monitor is created, open it in Uptimely (**Open monitor settings**), copy the heartbeat URL or secret key, paste it into the panel and press **Save key**. No ping is sent until the key is saved.
+- A new heartbeat monitor expects a ping every 5 minutes. Set the interval and grace period that suit the service in the monitor's Settings in Uptimely, otherwise it reports **Offline** between deploys.
+- The ping is a short request that never fails or slows a deploy. If Uptimely is unreachable, Dokploy logs the failure without the key and carries on.
+- **Remove** deletes the link in Dokploy and stops the pings. Uptimely has no monitor delete tool, so the monitor stays in Uptimely until you delete it there. **Unlink** on the uptime monitors leaves the heartbeat alone.
+
 ## Snapvisor: visual testing on preview deployments
 
 [Snapvisor](https://snapvisor.io) diffs screenshots from your CI against a baseline and lets your team approve or reject the changes. With the integration, each preview deployment of an application shows the review status of its build.
@@ -80,38 +89,49 @@ The Integrations page (`/dashboard/settings/integrations`) shows cards for Uptim
 2. Under **Visual testing (Snapvisor)**, pick the Snapvisor project. **Off** is the default.
 3. Each preview card now shows a Snapvisor badge: **Pending**, **No changes**, **Changes detected**, **Approved**, **Rejected**, **Error** or **Expired**, with a refresh button and a **Review in Snapvisor** link.
 
+**Branch and production deployments**
+
+The same link works for regular deployments. On the **Deployments** tab of an application or compose service, pick the Snapvisor project under **Visual testing (Snapvisor)** (it appears once Snapvisor is connected). Every finished deployment of that service that recorded its full commit SHA then shows the same badge, with a refresh button and a **Review in Snapvisor** link. A commit that has no build yet reads **No build yet**; an expired token, a rate limit or an unreachable Snapvisor reads **Unavailable** with the reason on hover. None of these affects the list. The commit is only trusted for git-sourced services (GitHub, GitLab, Bitbucket, Gitea, Git): for Docker-image, upload and raw-compose services the deployment text is free-form, so no badge or notification is produced from it.
+
+**Get notified when there are changes to review**
+
+Turn on **Snapvisor Visual Changes** on a notification channel (Settings → Notifications). When a deployment of a linked service, whether production, branch or preview, has a Snapvisor build for its commit and that build reaches **Changes detected**, the channel gets one message with the service, environment, branch, short commit, the number of changed snapshots and the review link.
+
+Dokploy finds out by asking Snapvisor itself (outbound, every few minutes), so it works on a panel that Snapvisor cannot reach. A deployed commit is watched for 6 hours; if its build never appears or never needs a review, nothing is sent. Each commit of a service is announced at most once, even across restarts and redeploys of the same commit.
+
 **Limits to know about**
 
 - The build is looked up by the full 40-character commit SHA of the preview's latest deployment. If your CI has not produced a build for that exact commit yet, the badge reads **Not registered**; refresh once the build exists.
-- The lookup applies to application previews. Dokploy polls while a build is still pending and stops once it reaches a final status.
+- The lookup applies to application and compose services. Dokploy polls while a build is still pending and stops once it reaches a final status.
 - Disconnecting removes the stored token and every application's project link. Builds already created in Snapvisor are unaffected.
 
 ## DoDomain: custom-domain connect and DNS verification
 
-[DoDomain](https://dodomain.io) lets the owner of a domain connect it to your service through a hosted flow: one-click Cloudflare sign-in, Domain Connect with the DNS provider, or guided manual DNS setup. DoDomain verifies the records and tells Dokploy through a webhook.
+[DoDomain](https://dodomain.io) lets the owner of a domain connect it to your service through a hosted flow: one-click Cloudflare sign-in, Domain Connect with the DNS provider, or guided manual DNS setup. DoDomain verifies the records, and Dokploy asks DoDomain for the result on its own, so it works on a panel that is not reachable from the internet. If the panel is public, DoDomain's webhooks add instant updates.
 
 **What you need**
 
 - A DoDomain app and its server-side secret key from the DoDomain dashboard.
-- The Dokploy panel reachable over HTTPS (Settings → Web Server). Saving the integration registers a webhook at `/api/webhooks/dodomain` on the panel's public URL, so DoDomain can report verification results.
+- Optional: the Dokploy panel on a public HTTPS URL (Settings → Web Server). Saving the integration then also registers a webhook at `/api/webhooks/dodomain`, so DoDomain can report results instantly. Without it, Dokploy polls DoDomain.
 
 **How to connect**
 
 1. Open Settings → Integrations and press **Connect DoDomain**.
 2. Fill in **Name**, **Secret key** and **App ID**. You can leave App ID blank and press **Test connection** to fill it in from the key.
 3. Leave **Base URL** at `https://app.dodomain.io` unless you run a self-hosted DoDomain.
-4. Press **Connect**. The card shows whether the webhook is registered.
+4. Press **Connect**. The card shows that status is polled and whether the optional webhook is registered.
 
 **How to use it**
 
 1. On a service's **Domains** tab, add the domain the customer owns. In the domain dialog, **Check DNS** shows which provider hosts it and how its owner will connect.
-2. In the domain's row, open the DoDomain actions menu and choose **Send connect link**. Dokploy shows the link, the DNS records it will request and when it expires. **Copy connect link** copies the active link and **Re-verify DNS** asks DoDomain to recheck an existing connection.
-3. Send the link to the domain's owner. When DoDomain reports back, the domain row shows **DNS verified**. Until then it shows **Awaiting domain owner**, and **DNS verification failed** when the records no longer match.
+2. In the domain's row, open the DoDomain actions menu and choose **Send connect link**. Dokploy shows the link, the DNS records it will request and when it expires. **Copy connect link** copies the active link and **Check now** asks DoDomain for the current state right away and shows the result.
+3. Send the link to the domain's owner. Dokploy checks DoDomain every couple of minutes, and the domain row shows **DNS verified** once the records match. Until then it shows **Awaiting domain owner**, and **DNS verification failed** when the records no longer match. Verified domains are re-checked every 30 minutes, so a broken connection is noticed and sent to your notification providers.
 
 **Limits to know about**
 
 - Only concrete hostnames can be connected. Wildcard hosts and generated `sslip.io` and `traefik.me` names cannot.
-- DoDomain only delivers webhooks to a public HTTPS address. If the panel is served on a private address (for example a Tailscale `*.ts.net` name, a `.local` or `.internal` host, or a private IP), DoDomain refuses to register the webhook or cannot deliver to it, so the domain status never updates by itself. Dokploy still saves the integration and shows a warning on the card and in the edit dialog. In that case, press **Re-verify DNS** to refresh a domain's status, or serve the panel on a public HTTPS URL to receive webhooks. **Re-verify DNS** is disabled until a connect link has been sent for the domain.
+- DoDomain only delivers webhooks to a public HTTPS address. If the panel is served on a private address (for example a Tailscale `*.ts.net` name, a `.local` or `.internal` host, or a private IP), DoDomain refuses to register the webhook or cannot deliver to it. Nothing breaks: Dokploy saves the integration, polls DoDomain for status, and the card says polling is in use. Serve the panel on a public HTTPS URL if you also want instant webhook updates. **Check now** is disabled until a connect link has been sent for the domain.
+- Connect links created before this polling existed carry no stored session token, so Dokploy cannot run the live DNS check for them; it still finds the connection once the owner finishes the flow. Send a new link to get the full polling behavior.
 - A DNS verification failure is sent to the notification providers that are subscribed to deploy failures.
 - Disconnecting removes the stored secret key and deletes the webhook endpoint from DoDomain. Domains keep their current verification state.
 
@@ -122,6 +142,12 @@ Sendly and Notifly are notification providers, so they live in Settings → Noti
 **Sendly** ([sendly.now](https://sendly.now)) sends notifications as email. Fields: **Name**, **API Key**, **Base URL** (defaults to `https://app.sendly.now`, the base URL of your Sendly instance), **From Address** and one or more **To Addresses**.
 
 **Notifly** ([notifly.io](https://notifly.io)) triggers a Notifly workflow for each notification. Fields: **Name**, **API Key**, **Base URL** (defaults to `https://api.notifly.io`), **Workflow Key** (the identifier of the workflow to trigger) and an optional **Subscriber ID** that defaults to `dokploy`.
+
+**Uptimely** ([getuptimely.com](https://getuptimely.com)) is also a provider. Choose **Uptimely** under **Select a provider**. When a deploy fails it declares an incident in the Uptimely project, and the next successful deploy of the same service resolves it. Fields: **Name**, **API Key**, **Project ID**, **Base URL** (defaults to `https://app.getuptimely.com`) and an optional **Resolved state ID**. It only reacts to the **App Build Error** switch (a success always resolves an open incident).
+
+- The Uptimely project needs **AI write operations** turned on, or Uptimely refuses to declare and resolve incidents. Dokploy logs the refusal and the deploy carries on.
+- Uptimely has no tool that lists incident states, so Dokploy reads the Resolved state from the project's existing incidents. If no incident has been resolved there yet, set **Resolved state ID** (the id of the project's Resolved incident state).
+- **Test Notification** only checks that the key can see the project. It never declares an incident.
 
 ## Related
 
